@@ -1,0 +1,74 @@
+name: Bug report
+description: Report reproducible integration behavior.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste exported configuration JSON, Mesh keys, Home Assistant
+        tokens, private keys or unreviewed Bluetooth captures.
+  - type: input
+    id: version
+    attributes:
+      label: Amaran BLE version
+      placeholder: 0.4.4-beta.1
+    validations:
+      required: true
+  - type: input
+    id: home_assistant
+    attributes:
+      label: Home Assistant version
+      placeholder: 2026.7.2
+    validations:
+      required: true
+  - type: dropdown
+    id: bluetooth
+    attributes:
+      label: Bluetooth path
+      options:
+        - ESPHome Bluetooth Proxy
+        - Local Home Assistant Bluetooth adapter
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: fixtures
+    attributes:
+      label: Fixture models and count
+      placeholder: 2x T2c, 1x 200x
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Explain what happened and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Turn on the control switch.
+        2. Wait for connected.
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics or logs
+      description: Review diagnostics before attaching them. Remove unrelated data.
+      render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I removed Mesh keys, tokens, private keys and real addresses from manually collected logs.
+          required: true
+        - label: Sidus Link and Amaran Desktop were closed during the test.
+          required: true

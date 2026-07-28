@@ -1,0 +1,105 @@
+# Amaran BLE for Home Assistant
+
+這是一個非官方 Home Assistant 自訂整合，透過 Home Assistant Bluetooth 或
+ESPHome Bluetooth Proxy，在本機控制既有的 Amaran / Sidus BLE Mesh。
+
+目前公開版本為 `0.4.4-beta.1`。這是第一個公開測試版，只支援匯入已由
+Amaran Desktop 或 Sidus Link 建立的 Mesh，不支援新增燈具配對或建立新 Mesh。
+
+[English documentation](README.md)
+
+## 已驗證燈具
+
+| 燈具 | 色溫 | HS 色彩 | G/M 設定資料 |
+| --- | --- | --- | --- |
+| amaran T2c | 2500-7500 K | 支援 | 支援 |
+| amaran 200x | 2700-6500 K | 不支援 | 不支援 |
+| amaran 300c | 2500-7500 K | 支援 | 支援 |
+
+實機環境為兩盞 T2c、一盞 200x 與一盞 300c，透過 ESPHome Bluetooth
+Proxy 控制同一個既有 Sidus Mesh。
+
+## 主要功能
+
+- 開關、亮度、CCT 與依燈具能力公開的 HS 色彩控制。
+- 多燈、多個動態 Mesh Proxy 候選，不寫死任何 MAC。
+- 總開關開啟時由 HA 接管並維持一條 Mesh Proxy 連線。
+- 總開關關閉時釋放 BLE，讓 Sidus Link 或 Amaran Desktop 恢復控制。
+- active proxy 失聯後自動切換其他已匯入燈具。
+- 診斷資料會遮蔽 Mesh key，並將所有 MAC 轉為一致的匿名代號。
+
+## HACS Custom Repository 安裝
+
+本 beta 尚未加入 HACS 預設清單：
+
+1. 開啟 HACS 的 **整合**。
+2. 從選單進入 **自訂存放庫**。
+3. 輸入 `https://github.com/Minwei21144/ha-amaran-ble`。
+4. 類別選擇 **Integration**。
+5. 下載 Amaran BLE，在版本選單指定 `v0.4.4-beta.1`。若看不到預發行版本，
+   請先在 HACS 對此 Repository 開啟 beta 版本追蹤。
+6. 重新啟動 Home Assistant。
+
+Home Assistant 最低版本為 `2026.7.0`。
+
+## 匯出既有 Mesh
+
+在已安裝 Amaran Desktop 的 Windows 電腦執行：
+
+```powershell
+.\amaran_export_ha_config.cmd
+```
+
+也可以直接執行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\amaran_export_ha_config.ps1
+```
+
+腳本需要 Python，會讀取 Amaran Desktop 的本機資料庫與燈具能力檔，建立
+`amaran-ble-ha-config.json`，並在終端機完整顯示 JSON，方便直接確認與複製。
+
+輸出的 `net_key` 與 `app_key` 等同 Mesh 控制密碼。請勿將 JSON 貼到公開
+Issue、Log、截圖或診斷附件。
+
+## 匯入與控制
+
+1. 到 **設定 > 裝置與服務 > 新增整合**。
+2. 搜尋 **Amaran BLE**。
+3. 貼上完整匯出 JSON。
+4. 開啟 `Amaran BLE 總開關`。
+5. 等待連線狀態成為 `connected` 後操作燈具。
+
+狀態意義：
+
+- `released`：HA 已釋放 Mesh。
+- `connecting`：正在掃描與嘗試候選燈具。
+- `stabilizing`：Mesh 已登入，正在通過 30 秒可操作觀察期。
+- `connected`：可以控制。
+- `unavailable`：目前沒有可用候選。
+
+連線持續 120 秒後才會在內部被標記為可信任代理；在觀察期內掉線的候選會
+暫時隔離，避免一直重選短時間成功、稍後又斷線的燈具。
+
+## 已知限制
+
+- 不支援建立新 Mesh 或 provisioning。
+- 首次接管通常需要數十秒；GATT 候選失敗時會更久。
+- 非 active proxy 的燈具斷電後，約需 30-60 秒才可能顯示不可用，以避免
+  BLE Mesh 正常丟包造成假離線。
+- 目前只有上表三種型號完成實機測試。
+- 這是逆向研究的社群整合，燈具或官方軟體更新後可能需要跟著調整。
+
+## Debug
+
+```yaml
+logger:
+  default: info
+  logs:
+    custom_components.amaran_ble: debug
+```
+
+分享診斷資料前仍應自行檢查內容。安全回報方式請見 [SECURITY.md](SECURITY.md)。
+
+本專案採用 [MIT License](LICENSE)，與 Amaran、Aputure 或 Sidus Link 官方
+沒有隸屬、背書或技術支援關係。

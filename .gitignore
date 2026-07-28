@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.log
+*.zip
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local exports and probe results may contain credentials or device addresses.
+amaran-ble-ha-config.json
+amaran-*-output*.json
+amaran-*-probe*.json
+*-diagnostics*.json
+*-diagnostics*.txt
+
+# Editor and operating-system files.
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
