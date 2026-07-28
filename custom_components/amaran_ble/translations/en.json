@@ -1,0 +1,41 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "title": "Amaran BLE",
+        "description": "Paste an Amaran mesh config JSON. If this flow was started from a scanned Bluetooth device, only the matching light will be added. Discovered: `{discovered}`. Example: `{example}`",
+        "data": {
+          "config_json": "Mesh config JSON"
+        }
+      },
+      "init": {
+        "title": "Reconfigure Amaran BLE",
+        "description": "Paste the complete Amaran mesh config JSON to update lights, proxy candidates, mesh addresses, or keys. Reload the integration after saving. Example: `{example}`",
+        "data": {
+          "config_json": "Mesh config JSON"
+        }
+      }
+    },
+    "error": {
+      "invalid_config_json": "The config JSON is invalid.",
+      "device_not_in_config_json": "The scanned Bluetooth device was not found in the config JSON."
+    },
+    "abort": {
+      "already_configured": "This Amaran BLE mesh is already configured.",
+      "not_amaran_mesh_proxy": "This Bluetooth device is not an Amaran BLE Mesh Proxy."
+    }
+  },
+  "entity": {
+    "switch": {
+      "control": {
+        "name": "Control"
+      }
+    },
+    "sensor": {
+      "connection": {
+        "name": "Connection"
+      }
+    }
+  }
+}

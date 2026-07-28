@@ -1,0 +1,27 @@
+"""Constants for the Amaran BLE integration."""
+
+from __future__ import annotations
+
+DOMAIN = "amaran_ble"
+
+CONF_APP_KEY = "app_key"
+CONF_CONFIG_JSON = "config_json"
+CONF_LIGHTS = "lights"
+CONF_MAC = "mac"
+CONF_MESH_ADDRESS = "mesh_address"
+CONF_NET_KEY = "net_key"
+CONF_PROXY_CANDIDATES = "proxy_candidates"
+CONF_RELAY_HUB = "relay_hub"
+CONF_LAST_SUCCESSFUL_PROXY = "last_successful_proxy"
+CONF_CONTROL_ENABLED = "control_enabled"
+
+DEFAULT_LOCAL_ADDRESS = 0x0001
+DEFAULT_GROUP_ADDRESS = 0xC000
+DEFAULT_TTL = 10
+
+MESH_PROXY_SERVICE_UUID = "00001828-0000-1000-8000-00805f9b34fb"
+PROVISIONING_DATA_OUT_UUID = "00002adc-0000-1000-8000-00805f9b34fb"
+PROXY_DATA_IN_UUID = "00002add-0000-1000-8000-00805f9b34fb"
+PROXY_DATA_OUT_UUID = "00002ade-0000-1000-8000-00805f9b34fb"
+
+TELINK_OPCODE = 0x26

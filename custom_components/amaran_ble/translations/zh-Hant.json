@@ -1,0 +1,41 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "title": "Amaran BLE",
+        "description": "貼上 Amaran Mesh 設定 JSON。若此流程是從已掃描的藍牙裝置啟動，會使用該裝置對應的燈具。已掃描：`{discovered}`。範例：`{example}`",
+        "data": {
+          "config_json": "Mesh 設定 JSON"
+        }
+      },
+      "init": {
+        "title": "重新設定 Amaran BLE",
+        "description": "貼上完整的 Amaran Mesh 設定 JSON，用來更新燈具、proxy candidates、mesh address 或 key。儲存後請重新載入整合。範例：`{example}`",
+        "data": {
+          "config_json": "Mesh 設定 JSON"
+        }
+      }
+    },
+    "error": {
+      "invalid_config_json": "設定 JSON 無效。",
+      "device_not_in_config_json": "掃描到的藍牙裝置不在設定 JSON 內。"
+    },
+    "abort": {
+      "already_configured": "這個 Amaran BLE Mesh 已經設定過。",
+      "not_amaran_mesh_proxy": "這個藍牙裝置不是 Amaran BLE Mesh Proxy。"
+    }
+  },
+  "entity": {
+    "switch": {
+      "control": {
+        "name": "總開關"
+      }
+    },
+    "sensor": {
+      "connection": {
+        "name": "連線狀態"
+      }
+    }
+  }
+}

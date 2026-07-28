@@ -1,0 +1,92 @@
+{
+  "version": "0.4.4",
+  "published_as": "0.4.4-beta.1",
+  "date": "2026-07-28",
+  "environment": {
+    "home_assistant_core": "2026.7.2",
+    "bluetooth_path": "ESPHome Bluetooth Proxy",
+    "fixture_count": 4
+  },
+  "offline_validation": {
+    "tests_passed": 123,
+    "tests_total": 123,
+    "repeat_loops": 30,
+    "repeat_test_executions": 3690,
+    "compileall": true,
+    "manifest_version": "0.4.4",
+    "diff_check": true
+  },
+  "core_restart": {
+    "stabilizing_seconds": 65.833,
+    "operational_seconds": 79.45,
+    "trusted_seconds": 172.344,
+    "proxy": "200x"
+  },
+  "normal_cycles": [
+    {
+      "cycle": 1,
+      "release_seconds": 2.566,
+      "operational_seconds": 39.502,
+      "trusted_seconds": 128.719,
+      "proxy": "200x",
+      "passed": true
+    },
+    {
+      "cycle": 2,
+      "release_seconds": 0.966,
+      "operational_seconds": 40.396,
+      "trusted_seconds": 128.6,
+      "proxy": "200x",
+      "passed": true
+    },
+    {
+      "cycle": 3,
+      "release_seconds": 2.616,
+      "operational_seconds": 61.752,
+      "trusted_seconds": 150.939,
+      "proxy": "T2c #2",
+      "passed": true
+    },
+    {
+      "cycle": 5,
+      "release_seconds": 1.006,
+      "operational_seconds": 57.323,
+      "trusted_seconds": 147.636,
+      "proxy": "200x",
+      "passed": true
+    }
+  ],
+  "normal_cycle_summary": {
+    "operational_min_seconds": 39.502,
+    "operational_median_seconds": 48.86,
+    "operational_max_seconds": 61.752,
+    "trusted_min_seconds": 128.6,
+    "trusted_median_seconds": 138.178,
+    "trusted_max_seconds": 150.939
+  },
+  "probation_fault_injection": {
+    "initial_proxy": "T2c #2",
+    "initial_operational_seconds": 40.154,
+    "power_cut_before_trusted": true,
+    "probation_disconnect_detected_seconds": 37.733,
+    "initial_quarantine_remaining_seconds": 294.3,
+    "fallback_proxy": "200x",
+    "fallback_stabilizing_seconds": 63.183,
+    "fallback_operational_seconds": 92.223,
+    "classification": "probation_disconnect",
+    "passed": true
+  },
+  "final_state": {
+    "connection": "connected",
+    "trusted": true,
+    "active_proxy": "200x",
+    "control_switch": "on",
+    "lights": [
+      "off",
+      "off",
+      "off",
+      "off"
+    ],
+    "t2c_2_power": "on"
+  }
+}

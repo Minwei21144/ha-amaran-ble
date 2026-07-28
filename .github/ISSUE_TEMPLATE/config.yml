@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/Minwei21144/ha-amaran-ble/security
+    about: Do not disclose vulnerabilities or leaked secrets in a public issue.
