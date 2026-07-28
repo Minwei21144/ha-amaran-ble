@@ -12,7 +12,9 @@ Bluetooth Proxy.
 > **Beta:** `0.4.4-beta.1` is the first public preview. It imports an existing
 > Sidus Mesh; it does not provision a new fixture or create a new Mesh.
 
-[Traditional Chinese documentation](README.zh-TW.md)
+[繁體中文文檔](README.zh-TW.md)
+
+![Amaran BLE controls in Home Assistant](docs/images/amaran-ble-dashboard.png)
 
 ## Features
 
