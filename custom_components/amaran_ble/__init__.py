@@ -7,11 +7,16 @@ try:
     from homeassistant.const import Platform
     from homeassistant.core import HomeAssistant
 
-    PLATFORMS: list[Platform] = [Platform.LIGHT, Platform.SWITCH, Platform.SENSOR]
+    PLATFORMS: list[Platform] = [
+        Platform.LIGHT,
+        Platform.NUMBER,
+        Platform.SWITCH,
+        Platform.SENSOR,
+    ]
 except ModuleNotFoundError:  # pragma: no cover - allows protocol-only tests outside HA.
     ConfigEntry = object  # type: ignore[assignment]
     HomeAssistant = object  # type: ignore[assignment]
-    PLATFORMS: list[str] = ["light", "switch", "sensor"]
+    PLATFORMS: list[str] = ["light", "number", "switch", "sensor"]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

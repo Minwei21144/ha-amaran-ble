@@ -52,6 +52,7 @@ def _install_homeassistant_light_stubs() -> None:
     const = ModuleType("homeassistant.const")
     class Platform(str, Enum):
         LIGHT = "light"
+        NUMBER = "number"
         SWITCH = "switch"
         SENSOR = "sensor"
 
@@ -105,6 +106,14 @@ models_module = importlib.import_module("custom_components.amaran_ble.models")
 
 
 class _FakeController:
+    def __init__(self, config: object) -> None:
+        color_state_module = importlib.import_module(
+            "custom_components.amaran_ble.color_state"
+        )
+        self._state = color_state_module.FixtureColorState.from_config(
+            config
+        )
+
     def is_light_available(self, _mac: str) -> bool:
         return False
 
@@ -115,15 +124,22 @@ class _FakeController:
     ) -> object:
         return lambda: None
 
-    def async_track_status(
+    def async_track_fixture_state(
         self,
         _mesh_address: int,
         _callback: object,
     ) -> object:
         return lambda: None
 
-    def last_status(self, _mesh_address: int) -> None:
-        return None
+    def fixture_state(self, _mesh_address: int) -> object:
+        return self._state.snapshot()
+
+    def seed_fixture_state(
+        self,
+        _mesh_address: int,
+        state: object,
+    ) -> None:
+        self._state = state.snapshot()
 
 
 def _fixture(*, supports_hs: bool) -> object:
@@ -136,7 +152,7 @@ def _fixture(*, supports_hs: bool) -> object:
         supports_hs=supports_hs,
         supports_gm=supports_hs,
     )
-    return light_module.AmaranBleLight(_FakeController(), config)
+    return light_module.AmaranBleLight(_FakeController(config), config)
 
 
 class LightRestoreTests(unittest.IsolatedAsyncioTestCase):
@@ -146,6 +162,7 @@ class LightRestoreTests(unittest.IsolatedAsyncioTestCase):
             state="on",
             attributes={
                 "brightness": 64,
+                "color_mode": light_module.ColorMode.HS,
                 "color_temp_kelvin": 8000,
                 "hs_color": (240.0, 100.0),
             },
@@ -164,13 +181,39 @@ class LightRestoreTests(unittest.IsolatedAsyncioTestCase):
         entity = _fixture(supports_hs=True)
         entity._test_last_state = SimpleNamespace(
             state="on",
-            attributes={"hs_color": (120.0, 80.0)},
+            attributes={
+                "brightness": 128,
+                "color_mode": light_module.ColorMode.HS,
+                "hs_color": (120.0, 80.0),
+            },
         )
 
         await entity.async_added_to_hass()
 
         self.assertEqual(entity._attr_color_mode, light_module.ColorMode.HS)
         self.assertEqual(entity._attr_hs_color, (120.0, 80.0))
+        self.assertEqual(entity._attr_brightness, 128)
+
+    async def test_restored_cct_is_quantized_and_preserves_gm(self) -> None:
+        entity = _fixture(supports_hs=True)
+        entity._test_last_state = SimpleNamespace(
+            state="on",
+            attributes={
+                "brightness": 128,
+                "color_mode": light_module.ColorMode.COLOR_TEMP,
+                "color_temp_kelvin": 4567,
+                "green_magenta": -4,
+            },
+        )
+
+        await entity.async_added_to_hass()
+
+        self.assertEqual(
+            entity._attr_color_mode,
+            light_module.ColorMode.COLOR_TEMP,
+        )
+        self.assertEqual(entity._attr_color_temp_kelvin, 4600)
+        self.assertEqual(entity.extra_state_attributes["green_magenta"], -4)
 
     def test_availability_update_normalizes_stale_unsupported_mode(self) -> None:
         entity = _fixture(supports_hs=False)

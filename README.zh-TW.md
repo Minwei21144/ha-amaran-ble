@@ -3,7 +3,8 @@
 這是一個非官方 Home Assistant 自訂整合，透過 Home Assistant Bluetooth 或
 ESPHome Bluetooth Proxy，在本機控制既有的 Amaran / Sidus BLE Mesh。
 
-目前公開版本為 `0.4.4-beta.1`。這是第一個公開測試版，只支援匯入已由
+目前 `main` 原始碼版本為 `0.5.0-beta.4`；在下一個 Release 發布前，HACS
+最新 tagged release 仍為 `v0.4.4-beta.1`。兩者都只支援匯入已由
 Amaran Desktop 或 Sidus Link 建立的 Mesh，不支援新增燈具配對或建立新 Mesh。
 
 [English documentation](README.md)
@@ -21,7 +22,8 @@ Proxy 控制同一個既有 Sidus Mesh。
 
 ## 主要功能
 
-- 開關、亮度、CCT 與依燈具能力公開的 HS 色彩控制。
+- 開關與依燈具能力公開的 Home Assistant 標準燈光控制。
+- 獨立亮度、100K 色溫、G/M、色調與飽和度數值控制。
 - 多燈、多個動態 Mesh Proxy 候選，不寫死任何 MAC。
 - 總開關開啟時由 HA 接管並維持一條 Mesh Proxy 連線。
 - 總開關關閉時釋放 BLE，讓 Sidus Link 或 Amaran Desktop 恢復控制。
@@ -36,8 +38,9 @@ Proxy 控制同一個既有 Sidus Mesh。
 2. 從選單進入 **自訂存放庫**。
 3. 輸入 `https://github.com/Minwei21144/ha-amaran-ble`。
 4. 類別選擇 **Integration**。
-5. 下載 Amaran BLE，在版本選單指定 `v0.4.4-beta.1`。若看不到預發行版本，
-   請先在 HACS 對此 Repository 開啟 beta 版本追蹤。
+5. 下載 Amaran BLE，選擇目前最新的預發行版本（下一個 Release 發布前為
+   `v0.4.4-beta.1`）。若看不到預發行版本，請先在 HACS 對此 Repository
+   開啟 beta 版本追蹤。
 6. 重新啟動 Home Assistant。
 
 Home Assistant 最低版本為 `2026.7.0`。
@@ -70,6 +73,20 @@ Issue、Log、截圖或診斷附件。
 4. 開啟 `Amaran BLE 總開關`。
 5. 等待連線狀態成為 `connected` 後操作燈具。
 
+## 數值控制
+
+整合保留標準 `light` 實體，並依燈具能力建立以下 `number` 實體：
+
+- **亮度：**每盞燈皆有，範圍為 `0.1%` 至 `100.0%`、步進 `0.1%`。使用
+  獨立 Mesh brightness 命令，不會切換目前的 CCT／HSI 模式。
+- **色溫：**依匯入燈具範圍，固定以 `100K` 為一步。
+- **G/M：**`-10` 至 `+10`，只建立於 `supports_gm: true` 的燈具。
+- **色調／飽和度：**色調 `0` 至 `360` 度、飽和度 `0%` 至 `100%`，只建立於
+  `supports_hs: true` 的燈具。
+
+調整單一數值時會保留其他色彩通道。HA 原生裝置頁會依目前語系的顯示名稱
+排序，不採用整合建立實體的順序。
+
 狀態意義：
 
 - `released`：HA 已釋放 Mesh。
@@ -87,6 +104,8 @@ Issue、Log、截圖或診斷附件。
 - 首次接管通常需要數十秒；GATT 候選失敗時會更久。
 - 非 active proxy 的燈具斷電後，約需 30-60 秒才可能顯示不可用，以避免
   BLE Mesh 正常丟包造成假離線。
+- HA 原生裝置頁自行決定控制項順序；除非顯示名稱前綴或使用自訂卡片，
+  整合無法強制指定畫面順序。
 - 目前只有上表三種型號完成實機測試。
 - 這是逆向研究的社群整合，燈具或官方軟體更新後可能需要跟著調整。
 

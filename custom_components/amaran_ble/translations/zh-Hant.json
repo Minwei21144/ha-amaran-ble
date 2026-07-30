@@ -36,6 +36,23 @@
       "connection": {
         "name": "連線狀態"
       }
+    },
+    "number": {
+      "color_temperature": {
+        "name": "色溫"
+      },
+      "green_magenta": {
+        "name": "G/M"
+      },
+      "hue": {
+        "name": "色調"
+      },
+      "saturation": {
+        "name": "飽和度"
+      },
+      "hsi_intensity": {
+        "name": "亮度"
+      }
     }
   }
 }

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 DOMAIN = "amaran_ble"
 
+ATTR_GREEN_MAGENTA = "green_magenta"
+
 CONF_APP_KEY = "app_key"
 CONF_CONFIG_JSON = "config_json"
 CONF_LIGHTS = "lights"

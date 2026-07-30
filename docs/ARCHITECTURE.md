@@ -48,6 +48,11 @@ Mesh status notifications update power, brightness, CCT and color state when
 the fixture reports them. Periodic status requests reconcile missed
 notifications and physical-control changes.
 
+The controller keeps one shared color-state snapshot per fixture. The standard
+light entity and the brightness, CCT, G/M, hue and saturation number entities
+subscribe to that snapshot, so physical reports and successful commands update
+all related Home Assistant entities consistently.
+
 Availability is deliberately conservative. A single missed Mesh response does
 not make a fixture unavailable because BLE Mesh packets are not acknowledged at
 the GATT transport level. Repeated misses are required, which means a powered

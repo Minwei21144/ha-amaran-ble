@@ -9,8 +9,10 @@ An unofficial Home Assistant custom integration for locally controlling an
 existing Amaran/Sidus BLE Mesh through Home Assistant Bluetooth or an ESPHome
 Bluetooth Proxy.
 
-> **Beta:** `0.4.4-beta.1` is the first public preview. It imports an existing
-> Sidus Mesh; it does not provision a new fixture or create a new Mesh.
+> **Source beta:** `main` currently contains `0.5.0-beta.4`. The latest tagged
+> HACS release remains `v0.4.4-beta.1` until the next release is published.
+> Both versions import an existing Sidus Mesh; they do not provision a new
+> fixture or create a new Mesh.
 
 [繁體中文文檔](README.zh-TW.md)
 
@@ -19,8 +21,9 @@ Bluetooth Proxy.
 ## Features
 
 - Local BLE Mesh control without a permanently running Windows PC or cloud API.
-- Power, brightness, CCT and HS color controls according to each fixture's
+- Power and standard Home Assistant light controls according to each fixture's
   declared capabilities.
+- Dedicated brightness, 100 K CCT, G/M, hue and saturation numeric controls.
 - Multiple fixtures and dynamic Mesh Proxy candidates; fixture MAC addresses
   are never hard-coded.
 - A control switch that acquires and keeps one Mesh Proxy connection while on,
@@ -62,9 +65,9 @@ the default HACS catalog.
 2. Open the menu and select **Custom repositories**.
 3. Enter `https://github.com/Minwei21144/ha-amaran-ble`.
 4. Select the **Integration** category and add the repository.
-5. Download **Amaran BLE** and select `v0.4.4-beta.1` under the version
-   selector. If pre-releases are hidden, enable beta versions for this HACS
-   repository first.
+5. Download **Amaran BLE** and select the latest available pre-release
+   (`v0.4.4-beta.1` until the next release is published). If pre-releases are
+   hidden, enable beta versions for this HACS repository first.
 6. Restart Home Assistant.
 
 [![Open your Home Assistant instance and add this repository to HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Minwei21144&repository=ha-amaran-ble&category=integration)
@@ -137,6 +140,22 @@ Example with non-real addresses and keys:
 Turning the control switch off disconnects Home Assistant so official Amaran
 applications can reconnect.
 
+## Numeric controls
+
+The integration keeps the standard Home Assistant light entity and adds
+fixture-specific number entities:
+
+- **Brightness:** `0.1%` to `100.0%` in `0.1%` steps for every fixture. It uses
+  the independent Mesh brightness command and does not switch CCT/HSI mode.
+- **Color temperature:** the imported fixture range in fixed `100 K` steps.
+- **G/M:** `-10` to `+10` when `supports_gm` is enabled.
+- **Hue:** `0` to `360 degrees` and **Saturation:** `0%` to `100%` when
+  `supports_hs` is enabled.
+
+Changing one numeric channel preserves its companion channels. The standard
+Home Assistant device page sorts these controls by localized display name; it
+does not preserve the integration's entity creation order.
+
 ## Connection lifecycle
 
 - `released`: Home Assistant is not holding a Mesh connection.
@@ -174,6 +193,8 @@ See [SECURITY.md](SECURITY.md) before reporting a security issue.
 - A powered-off non-proxy fixture may take roughly 30-60 seconds to become
   unavailable. The delay avoids false offline states caused by normal Mesh
   packet loss.
+- The native Home Assistant device page controls entity order. The integration
+  cannot force a custom order without visible name prefixes or a custom card.
 - Only the models listed above have been tested on physical hardware.
 - Brand artwork is intentionally not bundled until trademark-safe assets and a
   Home Assistant Brands submission are available.

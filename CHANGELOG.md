@@ -2,6 +2,27 @@
 
 All notable public changes are documented in this file.
 
+## 0.5.0-beta.4 - 2026-07-30
+
+- Add shared per-fixture color state synchronized between the standard light
+  entity and the new numeric controls.
+- Add a dedicated brightness control for every fixture with 0.1% resolution.
+  It uses the Mesh brightness command without changing the active CCT or HSI
+  mode.
+- Add a color-temperature control for every fixture with a fixed 100 K step.
+- Add G/M (`-10` to `+10`), hue (`1 degree`) and saturation (`1%`) controls
+  only when the imported fixture capabilities support them.
+- Preserve companion color channels when one numeric control is changed.
+- Quantize standard Home Assistant CCT commands to the fixture's 100 K
+  resolution and preserve the current G/M compensation.
+- Restore color state after Home Assistant restarts and update all related
+  entities from physical Mesh status reports.
+- Keep the native Home Assistant device UI. Its entity list is sorted by the
+  localized display name rather than integration creation order.
+- Retain recursive Mesh-key redaction and MAC-address pseudonymization in
+  public diagnostics.
+- Pass 136 offline tests, including the public diagnostics privacy tests.
+
 ## 0.4.4-beta.1 - 2026-07-28
 
 First public beta.

@@ -18,7 +18,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
-from .const import DOMAIN
+from .color_state import (
+    CCT_STEP_KELVIN,
+    FixtureColorState,
+    quantize_kelvin,
+)
+from .const import ATTR_GREEN_MAGENTA, DOMAIN
 from .controller import AmaranBleController
 from .models import AmaranLightConfig
 from .telink import TelinkStatus
@@ -63,7 +68,8 @@ class AmaranBleLight(LightEntity, RestoreEntity):
         self._attr_is_on = None
         self._attr_available = False
         self._attr_brightness = 255
-        self._attr_color_temp_kelvin = min(max(4500, config.min_kelvin), config.max_kelvin)
+        fixture_state = controller.fixture_state(config.mesh_address)
+        self._attr_color_temp_kelvin = fixture_state.kelvin
         self._attr_hs_color = (0.0, 100.0)
 
     async def async_added_to_hass(self) -> None:
@@ -76,36 +82,55 @@ class AmaranBleLight(LightEntity, RestoreEntity):
             )
         )
         self.async_on_remove(
-            self._controller.async_track_status(
+            self._controller.async_track_fixture_state(
                 self._config.mesh_address,
-                self._handle_status,
+                self._handle_fixture_state,
             )
         )
 
+        restored_state = self._controller.fixture_state(
+            self._config.mesh_address
+        )
         last_state = await self.async_get_last_state()
         if last_state is not None:
             if last_state.state == STATE_ON:
-                self._attr_is_on = True
+                restored_state.apply_power(True)
             elif last_state.state == STATE_OFF:
-                self._attr_is_on = False
+                restored_state.apply_power(False)
             if (brightness := last_state.attributes.get(ATTR_BRIGHTNESS)) is not None:
-                self._attr_brightness = int(brightness)
-            if (kelvin := last_state.attributes.get(ATTR_COLOR_TEMP_KELVIN)) is not None:
-                self._attr_color_temp_kelvin = max(
-                    self._config.min_kelvin,
-                    min(self._config.max_kelvin, int(kelvin)),
+                restored_state.apply_intensity(
+                    int(brightness) * 1000 / 255
                 )
-                self._attr_color_mode = ColorMode.COLOR_TEMP
+            gm = int(
+                last_state.attributes.get(
+                    ATTR_GREEN_MAGENTA,
+                    restored_state.gm,
+                )
+            )
+            if (kelvin := last_state.attributes.get(ATTR_COLOR_TEMP_KELVIN)) is not None:
+                restored_state.apply_cct(
+                    int(kelvin),
+                    restored_state.intensity,
+                    gm,
+                )
             if (
                 self._config.supports_hs
+                and last_state.attributes.get("color_mode") == ColorMode.HS
                 and (hs_color := last_state.attributes.get(ATTR_HS_COLOR)) is not None
             ):
                 hue, saturation = hs_color
-                self._attr_hs_color = (float(hue), float(saturation))
-                self._attr_color_mode = ColorMode.HS
-        self._ensure_supported_color_mode()
-        if (status := self._controller.last_status(self._config.mesh_address)) is not None:
-            self._handle_status(status)
+                restored_state.apply_hsi(
+                    hue,
+                    saturation,
+                    restored_state.intensity,
+                )
+            self._controller.seed_fixture_state(
+                self._config.mesh_address,
+                restored_state,
+            )
+        self._handle_fixture_state(
+            self._controller.fixture_state(self._config.mesh_address)
+        )
 
     @property
     def device_info(self) -> dict[str, Any]:
@@ -118,11 +143,24 @@ class AmaranBleLight(LightEntity, RestoreEntity):
             "connections": {("mac", self._config.mac)},
         }
 
+    @property
+    def extra_state_attributes(self) -> dict[str, int | float]:
+        """Expose Amaran-specific color metadata."""
+        state = self._controller.fixture_state(self._config.mesh_address)
+        return {
+            ATTR_GREEN_MAGENTA: state.gm,
+            "color_temperature_step_kelvin": CCT_STEP_KELVIN,
+            "hsi_intensity": state.intensity / 10,
+        }
+
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the light on."""
         _LOGGER.info("Amaran BLE turn_on requested for %s with %s", self._config.mac, kwargs)
         brightness = int(kwargs.get(ATTR_BRIGHTNESS, self._attr_brightness or 255))
         intensity = max(1, min(1000, round(brightness * 1000 / 255)))
+        fixture_state = self._controller.fixture_state(
+            self._config.mesh_address
+        )
 
         status: TelinkStatus | None = None
         # A delayed status report can briefly leave HA showing "on" after the
@@ -136,23 +174,29 @@ class AmaranBleLight(LightEntity, RestoreEntity):
 
         if ATTR_HS_COLOR in kwargs and self._config.supports_hs:
             hue, saturation = kwargs[ATTR_HS_COLOR]
+            hue = round(hue)
+            saturation = round(saturation)
             status = await self._controller.async_set_hsi(
                 self._config.mac,
                 self._config.mesh_address,
-                round(hue),
-                round(saturation),
+                hue,
+                saturation,
                 intensity,
             )
             self._attr_hs_color = (float(hue), float(saturation))
             self._attr_color_mode = ColorMode.HS
         elif ATTR_COLOR_TEMP_KELVIN in kwargs:
-            kelvin = int(kwargs[ATTR_COLOR_TEMP_KELVIN])
-            kelvin = max(self._config.min_kelvin, min(self._config.max_kelvin, kelvin))
+            kelvin = quantize_kelvin(
+                kwargs[ATTR_COLOR_TEMP_KELVIN],
+                self._config.min_kelvin,
+                self._config.max_kelvin,
+            )
             status = await self._controller.async_set_cct(
                 self._config.mac,
                 self._config.mesh_address,
                 kelvin,
                 intensity,
+                fixture_state.gm,
             )
             self._attr_color_temp_kelvin = kelvin
             self._attr_color_mode = ColorMode.COLOR_TEMP
@@ -210,20 +254,23 @@ class AmaranBleLight(LightEntity, RestoreEntity):
         self._ensure_supported_color_mode()
         self.async_write_ha_state()
 
-    def _handle_status(self, status: TelinkStatus) -> None:
-        """Handle decoded fixture status updates."""
-        self._attr_available = True
-        self._attr_is_on = status.on
-        self._attr_brightness = max(1, min(255, round(status.intensity * 255 / 1000)))
-        if status.is_hs and self._config.supports_hs:
+    def _handle_fixture_state(self, state: FixtureColorState) -> None:
+        """Handle shared physical or optimistic fixture state."""
+        if state.on is not None:
+            self._attr_is_on = state.on
+        self._attr_brightness = max(
+            1,
+            min(255, round(state.intensity * 255 / 1000)),
+        )
+        if state.is_hs and self._config.supports_hs:
             self._attr_color_mode = ColorMode.HS
-            self._attr_hs_color = (float(status.hue), float(status.saturation))
-        elif status.cct_kelvin:
-            self._attr_color_mode = ColorMode.COLOR_TEMP
-            self._attr_color_temp_kelvin = max(
-                self._config.min_kelvin,
-                min(self._config.max_kelvin, status.cct_kelvin),
+            self._attr_hs_color = (
+                float(state.hue),
+                float(state.saturation),
             )
+        else:
+            self._attr_color_mode = ColorMode.COLOR_TEMP
+            self._attr_color_temp_kelvin = state.kelvin
         self._ensure_supported_color_mode()
         self.async_write_ha_state()
 

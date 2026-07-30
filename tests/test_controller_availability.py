@@ -177,13 +177,22 @@ class ControllerAvailabilityTest(unittest.TestCase):
         )
 
         updates: list[bool] = []
+        state_updates: list[object] = []
         controller.async_track_availability(light.mac, updates.append)
+        controller.async_track_fixture_state(
+            light.mesh_address,
+            state_updates.append,
+        )
         controller._set_mesh_available(True)
         controller._handle_status(light.mesh_address, status)
 
         self.assertTrue(controller.is_light_available(light.mac))
         self.assertEqual(controller.last_status(light.mesh_address), status)
         self.assertEqual(updates, [True])
+        self.assertEqual(len(state_updates), 1)
+        self.assertTrue(state_updates[0].on)
+        self.assertEqual(state_updates[0].kelvin, 4500)
+        self.assertEqual(state_updates[0].intensity, 500)
 
     def test_command_wait_ignores_stale_non_matching_status(self) -> None:
         controller, light = self._make_controller()
@@ -280,6 +289,71 @@ class ControllerAvailabilityTest(unittest.TestCase):
             [item[3] for item in sent],
             ["turn_on", "turn_off", "set_brightness", "set_cct", "set_hsi"],
         )
+        state = controller.fixture_state(light.mesh_address)
+        self.assertFalse(state.on)
+        self.assertTrue(state.is_hs)
+        self.assertEqual(state.hue, 120)
+        self.assertEqual(state.saturation, 100)
+        self.assertEqual(state.intensity, 500)
+
+    def test_failed_color_command_does_not_change_shared_state(self) -> None:
+        controller, light = self._make_controller()
+        initial = controller.fixture_state(light.mesh_address)
+
+        async def fail_send(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("simulated GATT write failure")
+
+        controller._send_telink = fail_send  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(RuntimeError, "GATT write failure"):
+            asyncio.run(
+                controller.async_set_cct(
+                    light.mac,
+                    light.mesh_address,
+                    5600,
+                    500,
+                    5,
+                )
+            )
+
+        self.assertEqual(
+            controller.fixture_state(light.mesh_address),
+            initial,
+        )
+
+    def test_cct_command_normalizes_hardware_resolution(self) -> None:
+        controller, light = self._make_controller()
+        telink_module = importlib.import_module(
+            "custom_components.amaran_ble.telink"
+        )
+        payloads: list[bytes] = []
+
+        async def fake_send(
+            _proxy_address: str,
+            _address: int,
+            payload: bytes,
+            *_args: object,
+            **_kwargs: object,
+        ) -> None:
+            payloads.append(payload)
+
+        controller._send_telink = fake_send  # type: ignore[method-assign]
+
+        asyncio.run(
+            controller.async_set_cct(
+                light.mac,
+                light.mesh_address,
+                4550,
+                1200,
+                99,
+            )
+        )
+
+        self.assertEqual(payloads, [telink_module.cct(4600, 1000, 10)])
+        state = controller.fixture_state(light.mesh_address)
+        self.assertEqual(state.kelvin, 4600)
+        self.assertEqual(state.intensity, 1000)
+        self.assertEqual(state.gm, 10)
 
     def test_with_proxy_waits_for_session_before_sending(self) -> None:
         controller, light = self._make_controller()

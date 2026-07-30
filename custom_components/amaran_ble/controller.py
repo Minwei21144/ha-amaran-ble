@@ -20,6 +20,7 @@ from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant
 
 from . import mesh, telink
+from .color_state import FixtureColorState
 from .const import (
     DEFAULT_LOCAL_ADDRESS,
     CONF_CONTROL_ENABLED,
@@ -241,6 +242,10 @@ class AmaranBleController:
         self._advertisement_unsubscribe: Callable[[], None] | None = None
         self._availability_callbacks: dict[str, set[Callable[[bool], None]]] = {}
         self._status_callbacks: dict[int, set[Callable[[telink.TelinkStatus], None]]] = {}
+        self._fixture_state_callbacks: dict[
+            int,
+            set[Callable[[FixtureColorState], None]],
+        ] = {}
         self._control_callbacks: set[Callable[[bool], None]] = set()
         self._mesh_callbacks: set[Callable[[bool], None]] = set()
         self._diagnostic_callbacks: set[Callable[[], None]] = set()
@@ -249,6 +254,10 @@ class AmaranBleController:
         }
         self._last_status_seen: dict[int, float] = {}
         self._last_status: dict[int, telink.TelinkStatus] = {}
+        self._fixture_states: dict[int, FixtureColorState] = {
+            light.mesh_address: FixtureColorState.from_config(light)
+            for light in config.lights
+        }
         self._status_miss_count: dict[int, int] = {}
         self._connect_attempt_history: deque[dict[str, object]] = deque(maxlen=12)
         self._stopping = False
@@ -1559,12 +1568,57 @@ class AmaranBleController:
 
         return unsubscribe
 
+    def async_track_fixture_state(
+        self,
+        mesh_address: int,
+        callback: Callable[[FixtureColorState], None],
+    ) -> Callable[[], None]:
+        """Track shared color state changes for one fixture."""
+        callbacks = self._fixture_state_callbacks.setdefault(
+            mesh_address,
+            set(),
+        )
+        callbacks.add(callback)
+
+        def unsubscribe() -> None:
+            callbacks.discard(callback)
+            if not callbacks:
+                self._fixture_state_callbacks.pop(mesh_address, None)
+
+        return unsubscribe
+
+    def fixture_state(self, mesh_address: int) -> FixtureColorState:
+        """Return a detached snapshot of one fixture's shared color state."""
+        return self._fixture_states[mesh_address].snapshot()
+
+    def seed_fixture_state(
+        self,
+        mesh_address: int,
+        state: FixtureColorState,
+    ) -> None:
+        """Seed restored state until the first physical status is received."""
+        if mesh_address in self._last_status:
+            return
+        self._fixture_states[mesh_address] = state.snapshot()
+        self._notify_fixture_state(mesh_address)
+
+    def _notify_fixture_state(self, mesh_address: int) -> None:
+        """Publish one fixture's latest shared color state."""
+        snapshot = self.fixture_state(mesh_address)
+        for callback in list(
+            self._fixture_state_callbacks.get(mesh_address, ())
+        ):
+            callback(snapshot)
+
     def _handle_status(self, src: int, status: telink.TelinkStatus) -> None:
         """Dispatch one decoded status report."""
         _LOGGER.debug("Amaran BLE status from 0x%04x: %s", src, status)
         self._last_status[src] = status
         self._last_status_seen[src] = self.hass.loop.time()
         self._status_miss_count[src] = 0
+        if (fixture_state := self._fixture_states.get(src)) is not None:
+            fixture_state.apply_status(status)
+            self._notify_fixture_state(src)
         if (mac := self._mac_for_mesh_address(src)) is not None:
             self._set_light_available(mac, True)
         for callback in list(self._status_callbacks.get(src, ())):
@@ -1810,6 +1864,10 @@ class AmaranBleController:
             "recent_connect_attempts": connect_attempts,
             "status_miss_count": dict(self._status_miss_count),
             "light_available": dict(self._light_available),
+            "fixture_color_states": {
+                f"0x{mesh_address:04x}": state.as_dict()
+                for mesh_address, state in self._fixture_states.items()
+            },
         }
 
     def _last_error_hint(self) -> str | None:
@@ -3444,6 +3502,8 @@ class AmaranBleController:
             telink.onoff(True),
             command_name="turn_on",
         )
+        self._fixture_states[address].apply_power(True)
+        self._notify_fixture_state(address)
         return None
 
     async def async_turn_off(self, proxy_address: str, address: int) -> telink.TelinkStatus | None:
@@ -3454,6 +3514,8 @@ class AmaranBleController:
             telink.onoff(False),
             command_name="turn_off",
         )
+        self._fixture_states[address].apply_power(False)
+        self._notify_fixture_state(address)
         return None
 
     async def async_set_brightness(
@@ -3469,6 +3531,8 @@ class AmaranBleController:
             telink.brightness(intensity),
             command_name="set_brightness",
         )
+        self._fixture_states[address].apply_intensity(intensity)
+        self._notify_fixture_state(address)
         return None
 
     async def async_set_cct(
@@ -3480,12 +3544,25 @@ class AmaranBleController:
         gm_offset: int = 0,
     ) -> telink.TelinkStatus | None:
         """Set CCT mode and let notifications confirm asynchronously."""
+        fixture_state = self._fixture_states[address]
+        requested_state = fixture_state.snapshot()
+        requested_state.apply_cct(kelvin, intensity, gm_offset)
         await self._send_telink(
             proxy_address,
             address,
-            telink.cct(kelvin, intensity, gm_offset),
+            telink.cct(
+                requested_state.kelvin,
+                requested_state.intensity,
+                requested_state.gm,
+            ),
             command_name="set_cct",
         )
+        fixture_state.apply_cct(
+            requested_state.kelvin,
+            requested_state.intensity,
+            requested_state.gm,
+        )
+        self._notify_fixture_state(address)
         return None
 
     async def async_set_hsi(
@@ -3497,12 +3574,25 @@ class AmaranBleController:
         intensity: int,
     ) -> telink.TelinkStatus | None:
         """Set HSI mode and let notifications confirm asynchronously."""
+        fixture_state = self._fixture_states[address]
+        requested_state = fixture_state.snapshot()
+        requested_state.apply_hsi(hue, saturation, intensity)
         await self._send_telink(
             proxy_address,
             address,
-            telink.hsi(hue, saturation, intensity),
+            telink.hsi(
+                requested_state.hue,
+                requested_state.saturation,
+                requested_state.intensity,
+            ),
             command_name="set_hsi",
         )
+        fixture_state.apply_hsi(
+            requested_state.hue,
+            requested_state.saturation,
+            requested_state.intensity,
+        )
+        self._notify_fixture_state(address)
         return None
 
     async def async_refresh(self, proxy_address: str, address: int) -> None:

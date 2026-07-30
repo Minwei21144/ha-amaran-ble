@@ -36,6 +36,23 @@
       "connection": {
         "name": "Connection"
       }
+    },
+    "number": {
+      "color_temperature": {
+        "name": "Color temperature"
+      },
+      "green_magenta": {
+        "name": "G/M"
+      },
+      "hue": {
+        "name": "Hue"
+      },
+      "saturation": {
+        "name": "Saturation"
+      },
+      "hsi_intensity": {
+        "name": "Brightness"
+      }
     }
   }
 }
