@@ -9,10 +9,8 @@ An unofficial Home Assistant custom integration for locally controlling an
 existing Amaran/Sidus BLE Mesh through Home Assistant Bluetooth or an ESPHome
 Bluetooth Proxy.
 
-> **Source beta:** `main` currently contains `0.5.0-beta.4`. The latest tagged
-> HACS release remains `v0.4.4-beta.1` until the next release is published.
-> Both versions import an existing Sidus Mesh; they do not provision a new
-> fixture or create a new Mesh.
+> **Beta:** `v0.5.0-beta.4` imports an existing Sidus Mesh; it does not
+> provision a new fixture or create a new Mesh.
 
 [繁體中文文檔](README.zh-TW.md)
 
@@ -65,8 +63,7 @@ the default HACS catalog.
 2. Open the menu and select **Custom repositories**.
 3. Enter `https://github.com/Minwei21144/ha-amaran-ble`.
 4. Select the **Integration** category and add the repository.
-5. Download **Amaran BLE** and select the latest available pre-release
-   (`v0.4.4-beta.1` until the next release is published). If pre-releases are
+5. Download **Amaran BLE** and select `v0.5.0-beta.4`. If pre-releases are
    hidden, enable beta versions for this HACS repository first.
 6. Restart Home Assistant.
 
