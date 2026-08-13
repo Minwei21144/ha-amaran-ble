@@ -41,6 +41,7 @@ class DiagnosticsPrivacyTest(unittest.TestCase):
                 "lights": [{"mac": first_mac, "name": "Studio key"}],
             },
             "active_proxy": first_mac,
+            "pending_esphome_slot_releases": [first_mac, second_mac],
             "proxy_candidate_details": {
                 first_mac: {"error": f"Failed to connect to {first_mac}"},
                 second_mac: {"visible": True},
@@ -66,6 +67,10 @@ class DiagnosticsPrivacyTest(unittest.TestCase):
         self.assertIn(
             redacted["active_proxy"],
             redacted["proxy_candidate_details"],
+        )
+        self.assertEqual(
+            redacted["pending_esphome_slot_releases"][0],
+            redacted["active_proxy"],
         )
         self.assertIn("**REDACTED_MAC_2**", serialized)
         self.assertEqual(redacted["entry"]["lights"][0]["name"], "Studio key")

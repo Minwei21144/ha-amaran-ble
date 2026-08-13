@@ -44,7 +44,10 @@ def _install_homeassistant_light_stubs() -> None:
     bluetooth = ModuleType("homeassistant.components.bluetooth")
     bluetooth.async_ble_device_from_address = lambda *_args, **_kwargs: None
     bluetooth.async_last_service_info = lambda *_args, **_kwargs: None
-    bluetooth.BluetoothScanningMode = SimpleNamespace(ACTIVE="active")
+    bluetooth.BluetoothScanningMode = SimpleNamespace(
+        ACTIVE="active",
+        PASSIVE="passive",
+    )
 
     config_entries = ModuleType("homeassistant.config_entries")
     config_entries.ConfigEntry = object

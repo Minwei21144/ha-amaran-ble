@@ -54,6 +54,7 @@ def iter_files() -> list[Path]:
         for path in ROOT.rglob("*")
         if path.is_file()
         and ".git" not in path.parts
+        and ".codex-runtime" not in path.parts
         and "__pycache__" not in path.parts
         and ".pytest_cache" not in path.parts
     ]

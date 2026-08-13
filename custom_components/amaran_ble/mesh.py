@@ -213,8 +213,8 @@ def _network_pdu(
     net_payload: bytes,
 ) -> bytes:
     # Bluetooth Mesh control messages use an 8-byte NetMIC. Access messages
-    # use four bytes. Amaran Desktop follows this distinction for its Proxy
-    # Configuration PDUs.
+    # use four bytes. Amaran 1.0.71's libmesh stack follows this distinction for
+    # its Proxy Configuration PDUs.
     net_mic_len = 8 if ctl else 4
     encrypted_payload = _aes_ccm_encrypt(
         enc_key,
@@ -435,7 +435,7 @@ def build_secure_network_beacon(
     iv_index: int = 0,
     flags: int = 0,
 ) -> bytes:
-    """Build the Secure Network Beacon sent by Amaran Desktop on login."""
+    """Build the Secure Network Beacon sent by Amaran 1.0.71 on login."""
     beacon_body = (
         bytes([flags & 0xFF])
         + keys.network_id

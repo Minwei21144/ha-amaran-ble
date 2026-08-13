@@ -9,10 +9,13 @@ An unofficial Home Assistant custom integration for locally controlling an
 existing Amaran/Sidus BLE Mesh through Home Assistant Bluetooth or an ESPHome
 Bluetooth Proxy.
 
-> **Beta:** `v0.5.0-beta.4` imports an existing Sidus Mesh; it does not
+> **Beta:** `v0.5.0-beta.106` imports an existing Sidus Mesh; it does not
 > provision a new fixture or create a new Mesh.
 
 [繁體中文文檔](README.zh-TW.md)
+
+[v0.5.0-beta.106 release notes](docs/RELEASE-v0.5.0-beta.106.md) |
+[Changelog](CHANGELOG.md)
 
 ![Amaran BLE controls in Home Assistant](docs/images/amaran-ble-dashboard.png)
 
@@ -27,6 +30,8 @@ Bluetooth Proxy.
 - A control switch that acquires and keeps one Mesh Proxy connection while on,
   then releases it for Sidus Link or Amaran Desktop when turned off.
 - Proxy failover when the active fixture disconnects.
+- Topology-aware recovery when only part of the imported Mesh is powered, plus
+  bounded ESPHome GATT-slot release handling before reconnecting.
 - Periodic state refresh, Mesh status notifications and conservative
   availability tracking.
 - Diagnostics that redact Mesh keys and consistently pseudonymize MAC
@@ -63,7 +68,7 @@ the default HACS catalog.
 2. Open the menu and select **Custom repositories**.
 3. Enter `https://github.com/Minwei21144/ha-amaran-ble`.
 4. Select the **Integration** category and add the repository.
-5. Download **Amaran BLE** and select `v0.5.0-beta.4`. If pre-releases are
+5. Download **Amaran BLE** and select `v0.5.0-beta.106`. If pre-releases are
    hidden, enable beta versions for this HACS repository first.
 6. Restart Home Assistant.
 
@@ -193,6 +198,9 @@ See [SECURITY.md](SECURITY.md) before reporting a security issue.
 - The native Home Assistant device page controls entity order. The integration
   cannot force a custom order without visible name prefixes or a custom card.
 - Only the models listed above have been tested on physical hardware.
+- One-of-four and two-of-four partial-power acquisition have completed the
+  current qualification. Three-of-four, four-of-four and extended retention
+  stress testing are still pending.
 - Brand artwork is intentionally not bundled until trademark-safe assets and a
   Home Assistant Brands submission are available.
 

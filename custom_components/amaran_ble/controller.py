@@ -11,6 +11,7 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
+import homeassistant.core as ha_core
 from bleak_retry_connector import (
     BleakClientWithServiceCache,
     establish_connection,
@@ -34,24 +35,121 @@ from .models import AmaranConfig
 
 _LOGGER = logging.getLogger(__name__)
 EVENT_HOMEASSISTANT_STARTED = "homeassistant_started"
+EVENT_HOMEASSISTANT_STOP = "homeassistant_stop"
 
-# Match Amaran Desktop's AutoConnect lifecycle: scan the configured mesh nodes,
-# connect one node at a time, complete Proxy login, then retain that connection.
+# Match Amaran 1.0.71's Telink-derived AutoConnect lifecycle: scan the configured
+# mesh nodes, connect one node at a time, complete Proxy login, then retain it.
 CONNECT_MAX_ATTEMPTS = 1
+OFFICIAL_CONNECT_DELAY = 1.0
+OFFICIAL_GATT_CONNECT_TIMEOUT = 9.0
+OFFICIAL_SERVICE_DISCOVERY_TIMEOUT = 9.0
+OFFICIAL_SERVICE_READY_DELAY = 0.5
+OFFICIAL_REQUESTED_MTU = 517
+# Android's CONNECTION_PRIORITY_HIGH profile uses short connection intervals
+# while the GATT client is performing its initial service and CCCD work. An
+# ESPHome proxy already starts its own connection-parameter update during GATT
+# open; beta.75 proved that immediately issuing a second update overlaps that
+# pending command and is followed by HCI 0x08/0x22 disconnects. Keep the source
+# values in diagnostics, but let the remote backend own this lifecycle.
+POST_CONNECT_CONNECTION_PARAMS_ENABLED = False
+POST_CONNECT_MIN_INTERVAL = 9  # 11.25 ms, units of 1.25 ms.
+POST_CONNECT_MAX_INTERVAL = 12  # 15 ms, units of 1.25 ms.
+POST_CONNECT_LATENCY = 0
+POST_CONNECT_SUPERVISION_TIMEOUT = 2000  # 20 seconds, units of 10 ms.
+POST_CONNECT_PARAMS_REQUEST_TIMEOUT = 3.0
+# Android's one-second delay separates close() from a new local connectGatt().
+# HA already drains the previous remote client before reaching this point, and
+# beta.44-beta.45 showed that adding the delay to a fresh ESPHome allocation did
+# not improve physical opens. Keep it in diagnostics as source behavior only.
+ESPHOME_PRE_CONNECT_DELAY = 0.0
 GATT_CLIENT_CONNECT_TIMEOUT = 45.0
-GATT_ESTABLISH_DEADLINE = 40.0
+# bleak-esphome owns physical GATT establishment and service discovery as one
+# operation. The 0.3.39 30/30 run let that backend operation finish naturally;
+# later integration-level deadlines only cancelled work the remote radio was
+# still resolving. None means that the backend timeout is authoritative.
+GATT_ESTABLISH_DEADLINE: float | None = None
+# A passive advertisement proves that the fixture is present, but repeated
+# ESP_GATT_CONN_CONN_CANCEL/status 133 failures show that it does not always
+# leave the remote Proxy radio with a usable post-failure device context.
+# Refresh only the candidate that just failed before its next attempt. Beta.74
+# proved that switching the shared ESPHome scanner to ACTIVE adds contention
+# without producing a successful waited attempt, so the refresh must remain
+# passive and only wait for a packet newer than the failed attempt's baseline.
+PREOPEN_ADVERTISEMENT_RESYNC = True
+PREOPEN_ADVERTISEMENT_RESYNC_SCANNING_MODE = (
+    bluetooth.BluetoothScanningMode.PASSIVE
+)
+# Beta.58 proved that forcing ESPHome V3 without-cache did not improve physical
+# GATT establishment. Retain verified service data and use the normal cached
+# request path, matching the successful beta.53 and historical 0.3.39 runs.
+FORCE_FRESH_GATT_DISCOVERY = False
+# Beta.60's per-address-only cache completed zero of two 300-second ownership
+# windows. Restore the Mesh-verified cache behavior used by beta.59 so beta.61
+# can isolate candidate radio quality rather than changing two variables.
+SHARE_VERIFIED_GATT_CACHE_BETWEEN_CANDIDATES = True
+# ESPHome V3 without-cache does not report the connection to HA until both
+# service discovery and MTU exchange finish. Amaran's Telink firmware can
+# complete discovery but leave MTU exchange unanswered until the BLE
+# supervision timeout. Prime the standard Mesh Proxy handles observed on
+# independently discovered T2c fixtures so the proxy can use V3 with-cache and
+# report a physical open immediately. A later Mesh login still verifies the
+# profile before it is shared with any peer candidate.
+PRIME_TELINK_MESH_PROXY_BOOTSTRAP_CACHE = True
+TELINK_MESH_PROXY_SERVICE_HANDLE = 49
+TELINK_MESH_PROXY_DATA_IN_HANDLE = 51
+TELINK_MESH_PROXY_DATA_OUT_HANDLE = 53
+TELINK_MESH_PROXY_DATA_OUT_CCCD_HANDLE = 54
+TELINK_MESH_PROXY_BOOTSTRAP_MTU = 23
+CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
+# HA shares its scanner with every Bluetooth integration. Keep the normal
+# callback passive and wait for a temporarily active scanner to drain before
+# asking an ESPHome proxy to open a physical GATT link.
+ADVERTISEMENT_CALLBACK_SCANNING_MODE = bluetooth.BluetoothScanningMode.PASSIVE
+WAIT_FOR_SOURCE_SCANNER_PASSIVE = True
 CONNECT_CANDIDATES_PER_ROUND = 1
-CANDIDATE_FAILURE_COOLDOWN = 30.0
+CANDIDATE_FAILURE_COOLDOWN = 10.0
 SINGLE_CANDIDATE_FAILURE_COOLDOWN = 2.0
-GATT_FAILURE_COOLDOWN = 120.0
-POST_OPEN_FAILURE_COOLDOWN = 180.0
-SHORT_CONNECTION_COOLDOWN = 180.0
-PROBATION_CONNECTION_COOLDOWN = 300.0
+# A physical-link failure happens before the fixture owns a usable GATT
+# session. Keep its retry cadence close to the proven 0.3.39 baseline instead
+# of exponentially sidelining an otherwise reachable Mesh proxy.
+GATT_FAILURE_COOLDOWN = 10.0
+POST_OPEN_FAILURE_COOLDOWN = 10.0
+SHORT_CONNECTION_COOLDOWN = 10.0
+PROBATION_CONNECTION_COOLDOWN = 60.0
 CANDIDATE_FAILURE_COOLDOWN_MULTIPLIER = 1.5
-CANDIDATE_FAILURE_COOLDOWN_MAX = 300.0
+CANDIDATE_FAILURE_COOLDOWN_MAX = 60.0
 CANDIDATE_HEALTH_HISTORY_SIZE = 8
 CANDIDATE_HEALTH_DECAY = 0.8
 CANDIDATE_LAST_STABLE_BONUS = 1.5
+PREOPEN_FALLBACK_MIN_FAILURES = 2
+PREOPEN_FALLBACK_SKIP_ROUNDS = 1
+# Beta.76 showed that an unproven fallback with repeated status-133 failures
+# can consume a full 20-second GATT slot in every round while the last trusted
+# proxy remains the only candidate that has ever opened. Defer that fallback
+# for one bounded round after two pre-open failures. The helper immediately
+# releases the deferral when it is the only advertising candidate, preserving
+# single-fixture failover without hard-coding a MAC, model or fixture count.
+PREOPEN_FALLBACK_DEFERRAL_ENABLED = True
+# bleak-retry-connector 4.6.1 treats ESP_GATT_CONN_CONN_CANCEL as an ESPHome
+# slot-closing race and retries the same client after a four-second backoff.
+# Keep normal attempts single-shot so multi-fixture failover remains prompt,
+# but restore that upstream behavior after one surviving candidate has already
+# failed two complete pre-open attempts.
+SINGLE_CANDIDATE_CONNECTOR_SLOT_RETRY_ENABLED = True
+SINGLE_CANDIDATE_CONNECTOR_SLOT_RETRY_MIN_FAILURES = 2
+# Beta.86 proved that two to four same-client attempts can absorb an ESPHome
+# slot-closing race, but bleak-retry-connector's upstream nine-error allowance
+# can consume roughly 200 seconds before a stale client is rebuilt. Preserve
+# the useful short recovery while returning longer failure chains to the outer
+# lifecycle, which disposes the GATT client and confirms slot release.
+SINGLE_CANDIDATE_CONNECTOR_SLOT_RETRY_MAX_ATTEMPTS = 4
+# Beta.69-beta.71 proved that enforcing the RSSI tier on the actual candidate
+# list can turn harmless advertisement fluctuations into extra recovery
+# rounds. Keep the bounded helper for regression coverage, but let every fresh
+# visible candidate participate in each round.
+RSSI_FOCUS_ENABLED = False
+RSSI_FOCUS_WINDOW_DB = 6
+RSSI_FOCUS_MAX_FAILED_ROUNDS = 2
 CANDIDATE_HEALTH_WEIGHTS = {
     "stable": 8.0,
     "ready": 3.0,
@@ -84,33 +182,89 @@ TRUSTED_CONNECTION_SECONDS = 120.0
 DISCONNECT_TIMEOUT_CANDIDATE_COOLDOWN = 20.0
 DISCONNECT_SETTLE_SECONDS = 2.0
 CLIENT_CLEANUP_TIMEOUT = 5.0
+CLIENT_CLEANUP_DRAIN_TIMEOUT = 25.0
+ESPHOME_SLOT_RELEASE_CONFIRMATION_TIMEOUT = 25.0
+ESPHOME_SLOT_RELEASE_POLL_INTERVAL = 0.25
+# Once a cleanup timeout proves that ESPHome still owns the old allocation,
+# recheck its authoritative slot snapshot without issuing another GATT open.
+# Keep each foreground check short; the maintain loop continues polling until
+# the allocation disappears and a reusable slot is reported.
+ESPHOME_SLOT_RECOVERY_RECHECK_TIMEOUT = 5.0
 CONTROL_RELEASE_DRAIN_TIMEOUT = 25.0
+SHUTDOWN_RELEASE_DRAIN_TIMEOUT = 10.0
 SERVICE_CACHE_CLEAR_TIMEOUT = 2.0
 DISCOVERY_TIMEOUT = 3
-ADVERTISEMENT_MAX_AGE = 120.0
+# A fixture that stopped advertising is not a useful GATT candidate. Keep this
+# independent from Mesh status/availability aging: it only controls which
+# fixture may be selected while acquiring the shared Mesh Proxy connection.
+ADVERTISEMENT_MAX_AGE = 30.0
+WRITE_ONLY_ADVERTISEMENT_MAX_AGE = ADVERTISEMENT_MAX_AGE
 STARTUP_CONNECT_ADVERTISEMENT_MAX_AGE = 8.0
+# Clearing HA's merged advertisement history does not clear the originating
+# scanner's BLEDevice cache. If a post-failure packet narrowly misses the
+# three-second resync window, preserve the same scanner path only when the
+# packet used to select it was very recent. This avoids a false "device not
+# found" round without turning an old or cross-scanner cache entry into a GATT
+# candidate.
+PREOPEN_SCANNER_CACHE_FALLBACK_MAX_AGE = STARTUP_CONNECT_ADVERTISEMENT_MAX_AGE
 STARTUP_SCAN_GRACE = 30.0
-FILTER_STATUS_TIMEOUT = 3.0
-PROXY_READY_DELAY = 0.1
-NOTIFICATION_SETUP_TIMEOUT = 12.0
+# Keep a recently attempted alternative as ownership evidence across one long
+# ESPHome GATT attempt. Unlike the advertisement window, this is bounded so a
+# fixture that was powered off just before selection cannot suppress genuine
+# one-survivor recovery for the rest of the control-on cycle.
+OWNERSHIP_ALTERNATIVE_EVIDENCE_SECONDS = 90.0
+# Amaran 1.0.71's NetworkingController gives the complete two-step Proxy
+# Filter initialization (Set Filter Type -> status -> Add Addresses -> status)
+# one eight-second deadline.
+FILTER_STATUS_TIMEOUT = 8.0
+PROXY_READY_DELAY = 0.2
+# A remote ESPHome descriptor write includes API transport and controller
+# scheduling. Do not cancel a healthy Proxy-Out CCCD operation at the
+# historical local-radio 12-second boundary; beta.64 isolates 30 seconds.
+NOTIFICATION_SETUP_TIMEOUT = 30.0
 GATT_NOTIFICATION_SETTLE_SECONDS = 3.0
 GATT_NOTIFICATION_RECOVERY_SETTLE_SECONDS = 5.0
 WRITE_ONLY_RECOVERY_SETTLE_SECONDS = 2.0
 NOTIFICATION_RETRY_DELAY = 60.0
 INITIAL_NOTIFICATION_DELAY = 30.0
+GATT_AUTHORIZATION_RECONNECT_SETTLE_SECONDS = 8.0
+# The historical 0.3.39 stress run recovered from a terminal CCCD
+# authorization failure by rotating to another visible Mesh proxy. Reusing
+# the same fixture immediately can repeat the stale remote GATT state and
+# delays the candidate that may already be ready to accept ownership.
+GATT_AUTHORIZATION_SAME_CANDIDATE_RETRY = False
+# Keep beta.71's immediate handoff when another fresh Mesh Proxy exists. If
+# only one fixture is currently reachable, however, there is nowhere useful to
+# hand off: dispose the rejected GATT object and give that fixture one bounded
+# official-style reconnect with a fresh client.
+SINGLE_CANDIDATE_GATT_AUTHORIZATION_RETRY = True
 AUTO_CONNECT_DELAY = 0.5
-RELEASE_RECONNECT_COOLDOWN = 2
-SHORT_RELEASE_RECONNECT_COOLDOWN = 2.0
+# ESPHome may report client.disconnect() complete before its physical BLE slot
+# is reusable. Keep fast Off/On cycles behind a bounded release window so the
+# first reconnect does not start a self-sustaining CONN_CANCEL cleanup storm.
+RELEASE_RECONNECT_COOLDOWN = 30.0
+SHORT_RELEASE_RECONNECT_COOLDOWN = 45.0
 MAINTAIN_RETRY_DELAYS = (1, 2, 5, 10)
 OUT_OF_SLOTS_RETRY_DELAY = 4
 GATT_ESTABLISH_RETRY_DELAY = 2
 RECOVERY_RETRY_DELAY = 12
+SINGLE_CANDIDATE_ADVERTISEMENT_RESYNC_RETRY_DELAY = 8
 PREFERRED_PROXY_GATT_RECOVERY_DELAY = 30
 PREOPEN_STORM_ROUNDS = 2
 # Preserve the 0.3.34 fixed recovery timing, which had the best 30-cycle
 # connection latency of the comparable long-running tests.
 PREOPEN_STORM_RECOVERY_DELAY = 30
+# A bounded deferral can temporarily make a multi-proxy Mesh look like a
+# single-candidate round. Do not apply the true one-survivor eight-second
+# cadence in that case: both radios have just participated in recovery and the
+# ESPHome controller benefits from the same quiet window used for a pre-open
+# failure storm.
+DEFERRED_MULTI_CANDIDATE_RECOVERY_DELAY = PREOPEN_STORM_RECOVERY_DELAY
 NO_FRESH_ADVERTISEMENT_RETRY_DELAY = 2
+ADVERTISEMENT_RESYNC_CONNECT_SETTLE_SECONDS = 0.1
+SCANNER_PASSIVE_WAIT_TIMEOUT = 20.0
+SCANNER_MODE_POLL_INTERVAL = 0.25
+POST_ACTIVE_SCAN_SETTLE_SECONDS = 1.0
 PROXY_HEALTH_CHECK_INTERVAL = 5
 STATUS_REFRESH_INTERVAL = 10
 STATUS_MISS_LIMIT = 4
@@ -158,22 +312,109 @@ class _AmaranBleakClient(BleakClientWithServiceCache):
         self,
         *args: object,
         amaran_client_created: Callable[[object], None] | None = None,
+        amaran_backend_created: Callable[[object], None] | None = None,
+        amaran_connect_attempt_started: Callable[[], None] | None = None,
+        amaran_retry_transient_slot_errors: bool = False,
+        amaran_retry_transient_slot_errors_max_attempts: int = (
+            SINGLE_CANDIDATE_CONNECTOR_SLOT_RETRY_MAX_ATTEMPTS
+        ),
         **kwargs: object,
     ) -> None:
         super().__init__(*args, **kwargs)
+        self._amaran_backend_created = amaran_backend_created
+        self._amaran_connect_attempt_started = amaran_connect_attempt_started
+        self._amaran_retry_transient_slot_errors = (
+            amaran_retry_transient_slot_errors
+        )
+        self._amaran_retry_transient_slot_errors_max_attempts = max(
+            1,
+            int(amaran_retry_transient_slot_errors_max_attempts),
+        )
+        self._amaran_connect_attempts = 0
+        self._amaran_backend: object | None = None
         if amaran_client_created is not None:
             amaran_client_created(self)
 
+    def _remember_amaran_backend(self, backend: object) -> None:
+        """Retain the selected backend for bounded ESPHome slot cleanup."""
+        self._amaran_backend = backend
+        if self._amaran_backend_created is not None:
+            self._amaran_backend_created(backend)
+
+    @staticmethod
+    def _wrap_selected_backend_factory(
+        wrapped_backend: object,
+        callback: Callable[[object], None],
+    ) -> bool:
+        """Invoke a callback after HA creates the selected ESPHome backend."""
+        backend_factory = getattr(wrapped_backend, "client", None)
+        if not callable(backend_factory):
+            return False
+
+        _LOGGER.debug(
+            "Amaran BLE selected backend factory type=%s module=%s",
+            getattr(backend_factory, "__qualname__", type(backend_factory).__name__),
+            getattr(backend_factory, "__module__", ""),
+        )
+
+        def create_backend(
+            *factory_args: object,
+            **factory_kwargs: object,
+        ) -> object:
+            backend = backend_factory(*factory_args, **factory_kwargs)
+            callback(backend)
+            return backend
+
+        setattr(wrapped_backend, "client", create_backend)
+        return True
+
+    def _async_get_best_available_backend_and_device(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        """Hook the selected HA backend factory before its connect call."""
+        wrapped_backend = super()._async_get_best_available_backend_and_device(
+            *args,
+            **kwargs,
+        )
+        self._wrap_selected_backend_factory(
+            wrapped_backend,
+            self._remember_amaran_backend,
+        )
+        return wrapped_backend
+
     async def connect(self, *args: object, **kwargs: object) -> object:
-        """Run one complete GATT attempt without connector-internal retries."""
+        """Run one GATT attempt and optionally expose slot races upstream."""
+        self._amaran_connect_attempts += 1
+        if self._amaran_connect_attempt_started is not None:
+            self._amaran_connect_attempt_started()
         kwargs["timeout"] = GATT_CLIENT_CONNECT_TIMEOUT
         try:
             return await super().connect(*args, **kwargs)
         except BleakError as err:
+            if (
+                self._amaran_retry_transient_slot_errors
+                and "esp_gatt_conn_conn_cancel" in str(err).lower()
+                and self._amaran_connect_attempts
+                < self._amaran_retry_transient_slot_errors_max_attempts
+            ):
+                # Let bleak-retry-connector reuse this client and apply its
+                # authoritative four-second ESPHome slot-closing backoff.
+                raise
             # bleak-retry-connector retries ESP status 133 up to nine times even
             # when max_attempts=1.  That keeps HA on one fixture for minutes.
             # Convert the completed backend attempt to a non-Bleak exception so
             # the integration can rotate mesh proxy candidates immediately.
+            if (
+                self._amaran_retry_transient_slot_errors
+                and "esp_gatt_conn_conn_cancel" in str(err).lower()
+            ):
+                raise RuntimeError(
+                    "Single Amaran GATT retry budget exhausted after "
+                    f"{self._amaran_connect_attempts} attempts: "
+                    f"{type(err).__name__}: {err}"
+                ) from err
             raise RuntimeError(
                 f"Single Amaran GATT attempt failed: {type(err).__name__}: {err}"
             ) from err
@@ -204,19 +445,34 @@ class AmaranBleController:
         self._candidate_post_open_quarantine_until: dict[str, float] = {}
         self._candidate_failure_reason: dict[str, str] = {}
         self._candidate_failure_streak: dict[str, int] = {}
+        self._candidate_probe_after_round: dict[str, int] = {}
         self._round_failed_candidates: set[str] = set()
+        self._preferred_ownership_first_attempt_pending = True
+        self._candidate_advertisement_seen_at: dict[str, float] = {}
         self._consecutive_preopen_failures = 0
         self._notification_backoff_until: dict[str, float] = {}
         self._service_cache_bypass: set[str] = set()
         self._cccd_reconnect_pending: set[str] = set()
         self._cached_cccd_retry_attempted: set[str] = set()
         self._uncached_recovery_attempted: set[str] = set()
+        self._authorization_recovery_attempted: set[str] = set()
+        self._authorization_reconnect_after = 0.0
+        self._verified_gatt_cache_template: tuple[object, int, str] | None = None
+        self._shared_gatt_cache_sources: dict[str, str] = {}
+        self._bootstrap_gatt_cache_sources: set[str] = set()
+        self._shared_gatt_cache_incompatible: set[str] = set()
         self._current_connect_trace: dict[str, object] | None = None
         self._connect_attempt_stats: dict[str, int] = {}
+        self._last_esphome_slot_release: dict[str, object] | None = None
+        self._pending_esphome_slot_releases: dict[str, object] = {}
+        self._esphome_slot_recovery_resync_pending = False
         self._candidate_health_history: dict[str, deque[str]] = {}
         self._connect_attempt_sequence = 0
         self._ownership_cycle = 1
+        self._ownership_attempted_candidates: set[str] = set()
+        self._ownership_candidate_attempted_at: dict[str, float] = {}
         self._candidate_round = 1
+        self._rssi_focus_failed_rounds = 0
         self._command_trace_sequence = 0
         self._command_trace_stats: dict[str, int] = {}
         self._recent_command_traces: deque[dict[str, object]] = deque(
@@ -239,6 +495,7 @@ class AmaranBleController:
         self._advertisement_event = asyncio.Event()
         self._homeassistant_started = self._hass_has_started()
         self._startup_unsubscribe: Callable[[], None] | None = None
+        self._shutdown_unsubscribe: Callable[[], None] | None = None
         self._advertisement_unsubscribe: Callable[[], None] | None = None
         self._availability_callbacks: dict[str, set[Callable[[bool], None]]] = {}
         self._status_callbacks: dict[int, set[Callable[[telink.TelinkStatus], None]]] = {}
@@ -259,6 +516,10 @@ class AmaranBleController:
             for light in config.lights
         }
         self._status_miss_count: dict[int, int] = {}
+        self._status_seen_in_session: set[int] = set()
+        self._initial_status_census_complete = False
+        self._mesh_session_sequence = 0
+        self._mesh_session_started_at: float | None = None
         self._connect_attempt_history: deque[dict[str, object]] = deque(maxlen=12)
         self._stopping = False
 
@@ -266,6 +527,7 @@ class AmaranBleController:
         """Start a delayed single-proxy connector."""
         self._stopping = False
         self._entry = entry
+        self._register_shutdown_listener()
         options = getattr(entry, "options", None)
         if isinstance(options, Mapping):
             self._control_enabled = bool(options.get(CONF_CONTROL_ENABLED, True))
@@ -292,6 +554,45 @@ class AmaranBleController:
                     EVENT_HOMEASSISTANT_STARTED,
                     self._handle_homeassistant_started,
                 )
+
+    def _register_shutdown_listener(self) -> None:
+        """Release the retained GATT session before Home Assistant exits."""
+        if self._shutdown_unsubscribe is not None:
+            return
+        add_shutdown_job = getattr(self.hass, "async_add_shutdown_job", None)
+        hass_job_type = getattr(ha_core, "HassJob", None)
+        if add_shutdown_job is not None and hass_job_type is not None:
+            self._shutdown_unsubscribe = add_shutdown_job(
+                hass_job_type(self._handle_homeassistant_shutdown)
+            )
+            return
+        bus = getattr(self.hass, "bus", None)
+        listen_once = getattr(bus, "async_listen_once", None)
+        if listen_once is None:
+            return
+        self._shutdown_unsubscribe = listen_once(
+            EVENT_HOMEASSISTANT_STOP,
+            self._handle_homeassistant_stop,
+        )
+
+    async def _handle_homeassistant_stop(self, event: object) -> None:
+        """Fallback stop-event bridge for Home Assistant without shutdown jobs."""
+        _ = event
+        await self._handle_homeassistant_shutdown()
+
+    async def _handle_homeassistant_shutdown(self) -> None:
+        """Cleanly return the ESPHome GATT slot during Core shutdown."""
+        # A one-time event listener is removed before its target runs. A
+        # shutdown job is already being iterated by Core. Neither callback
+        # should remove itself while the shutdown sequence is executing.
+        self._shutdown_unsubscribe = None
+        _LOGGER.info(
+            "Home Assistant is stopping; releasing the Amaran BLE proxy session"
+        )
+        await self.async_stop(
+            cleanup_timeout=SHUTDOWN_RELEASE_DRAIN_TIMEOUT,
+            fast_session_release=True,
+        )
 
     def _ensure_maintain_task(self) -> None:
         """Ensure the background connector exists."""
@@ -330,7 +631,7 @@ class AmaranBleController:
                 self.hass,
                 self._handle_bluetooth_advertisement,
                 {"service_uuid": MESH_PROXY_SERVICE_UUID},
-                bluetooth.BluetoothScanningMode.ACTIVE,
+                ADVERTISEMENT_CALLBACK_SCANNING_MODE,
             )
         except Exception:
             _LOGGER.debug(
@@ -347,17 +648,33 @@ class AmaranBleController:
         address = str(getattr(service_info, "address", "")).upper()
         if address not in self._proxy_addresses():
             return
-        self.hass.loop.call_soon_threadsafe(self._wake_for_advertisement, address)
+        self.hass.loop.call_soon_threadsafe(
+            self._wake_for_advertisement,
+            address,
+            getattr(service_info, "time", None),
+        )
 
-    def _wake_for_advertisement(self, address: str) -> None:
+    def _wake_for_advertisement(
+        self,
+        address: str,
+        seen_at: object | None = None,
+    ) -> None:
         """Trigger a quick reconnect after a fresh proxy advertisement."""
-        if self._stopping or not self._control_enabled:
-            return
         if address not in self._proxy_addresses():
             return
         now = self.hass.loop.time()
+        observed_at = now
+        with contextlib.suppress(TypeError, ValueError):
+            observed_at = float(seen_at)
+        self._candidate_advertisement_seen_at[address] = max(
+            self._candidate_advertisement_seen_at.get(address, 0.0),
+            observed_at,
+        )
+        if self._stopping or not self._control_enabled:
+            return
         self._next_connect_after = max(
             self._release_guard_until,
+            self._authorization_reconnect_after,
             min(self._next_connect_after, now),
         )
         self._advertisement_event.set()
@@ -496,7 +813,11 @@ class AmaranBleController:
                     "still draining in the background"
                 )
             for proxy_address in list(self._sessions):
-                await self._reset_proxy(proxy_address)
+                # The official SDK disposes its GATT connection directly. It
+                # does not write CCCD notification-disable values before the
+                # disconnect, so mirror that release order for remote ESPHome
+                # clients as well.
+                await self._reset_proxy(proxy_address, fast=True)
             self._reset_connection_recovery_state()
             self._set_mesh_available(False)
         for callback in list(self._control_callbacks):
@@ -509,8 +830,39 @@ class AmaranBleController:
         self._cccd_reconnect_pending.clear()
         self._cached_cccd_retry_attempted.clear()
         self._uncached_recovery_attempted.clear()
+        self._authorization_recovery_attempted.clear()
+        self._authorization_reconnect_after = 0.0
+        self._ownership_attempted_candidates.clear()
+        self._ownership_candidate_attempted_at.clear()
         self._round_failed_candidates.clear()
+        self._candidate_probe_after_round.clear()
+        self._rssi_focus_failed_rounds = 0
+        self._preferred_ownership_first_attempt_pending = True
         self._consecutive_preopen_failures = 0
+        reset_preopen: list[str] = []
+        for address, reason in list(self._candidate_failure_reason.items()):
+            if reason not in {"gatt_connect", "gatt_or_service_discovery"}:
+                continue
+            # A deliberate control Off/On starts a new ownership cycle. Do not
+            # inherit the previous cycle's exponential pre-open cooldown, or a
+            # reachable fixture can remain filtered for up to five minutes.
+            # Post-open quarantine is separate and remains intact.
+            if address in self._candidate_post_open_quarantine_until:
+                continue
+            self._candidate_cooldown_until.pop(address, None)
+            self._candidate_failure_streak.pop(address, None)
+            self._candidate_failure_reason.pop(address, None)
+            reset_preopen.append(address)
+        if reset_preopen:
+            key = "ownership_preopen_backoff_resets"
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0) + len(reset_preopen)
+            )
+            _LOGGER.info(
+                "Starting a new Amaran BLE ownership cycle with %s stale "
+                "pre-open candidate backoff(s) cleared",
+                len(reset_preopen),
+            )
 
     def _record_release_guard(self, now: float) -> float:
         """Record a safe reacquire delay for an intentional control release."""
@@ -578,15 +930,6 @@ class AmaranBleController:
 
         return asyncio.create_task(coro, name=name)
 
-    async def _cancel_candidate_cleanup_tasks(self) -> None:
-        """Stop and drain background cleanup from a completed candidate race."""
-        tasks = list(self._candidate_cleanup_tasks)
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._candidate_cleanup_tasks.clear()
-
     async def _wait_candidate_cleanup_tasks(
         self,
         *,
@@ -611,13 +954,23 @@ class AmaranBleController:
 
     def _connection_cleanup_in_progress(self) -> bool:
         """Return whether a cancelled GATT connection is still being released."""
-        return bool(self._pending_clients) or any(
-            not task.done() for task in self._candidate_cleanup_tasks
+        return (
+            bool(self._pending_clients)
+            or bool(self._pending_esphome_slot_releases)
+            or any(not task.done() for task in self._candidate_cleanup_tasks)
         )
 
-    async def async_stop(self) -> None:
+    async def async_stop(
+        self,
+        *,
+        cleanup_timeout: float = CONTROL_RELEASE_DRAIN_TIMEOUT,
+        fast_session_release: bool = False,
+    ) -> None:
         """Stop work and release all BLE connections."""
         self._stopping = True
+        if self._shutdown_unsubscribe is not None:
+            self._shutdown_unsubscribe()
+            self._shutdown_unsubscribe = None
         if self._startup_unsubscribe is not None:
             self._startup_unsubscribe()
             self._startup_unsubscribe = None
@@ -635,7 +988,13 @@ class AmaranBleController:
                 await self._connect_task
             self._connect_task = None
 
-        await self._cancel_candidate_cleanup_tasks()
+        cleanup_complete = await self._wait_candidate_cleanup_tasks(
+            timeout=cleanup_timeout,
+        )
+        if not cleanup_complete:
+            _LOGGER.warning(
+                "Amaran BLE GATT cleanup is still draining while the controller stops"
+            )
 
         for task in self._notification_upgrade_tasks.values():
             task.cancel()
@@ -647,7 +1006,11 @@ class AmaranBleController:
         self._notification_upgrade_tasks.clear()
 
         for proxy_address in list(self._sessions):
-            await self._reset_proxy(proxy_address)
+            await self._reset_proxy(
+                proxy_address,
+                fast=fast_session_release,
+            )
+        _LOGGER.info("Amaran BLE proxy sessions are released")
 
     def _next_sequence(self) -> int:
         self._sequence = (self._sequence + 1) & 0xFFFFFF
@@ -770,6 +1133,61 @@ class AmaranBleController:
         if failed_address not in addresses:
             self._candidate_cursor += 1
             return
+        detail = self._format_error(err).lower()
+        broad_round_members = self._candidate_round_members(
+            include_deferred=True,
+            include_rssi_fallback=True,
+        )
+        attempted_alternatives, _expired_alternatives = (
+            self._ownership_alternative_evidence(failed_address)
+        )
+        single_candidate_authorization_retry = bool(
+            SINGLE_CANDIDATE_GATT_AUTHORIZATION_RETRY
+            and broad_round_members == {failed_address}
+            and not attempted_alternatives
+        )
+        if (
+            (
+                GATT_AUTHORIZATION_SAME_CANDIDATE_RETRY
+                or single_candidate_authorization_retry
+            )
+            and "insufficient authorization" in detail
+            and failed_address not in self._authorization_recovery_attempted
+        ):
+            # The official client disposes the invalid GATT object and creates
+            # a fresh one. With alternatives, beta.71 still hands off instead;
+            # this bounded same-candidate retry is for a one-survivor Mesh.
+            self._authorization_recovery_attempted.add(failed_address)
+            self._candidate_cursor = addresses.index(failed_address)
+            self._candidate_cooldown_until.pop(failed_address, None)
+            self._candidate_post_open_quarantine_until.pop(failed_address, None)
+            self._round_failed_candidates.discard(failed_address)
+            self._authorization_reconnect_after = max(
+                self._authorization_reconnect_after,
+                self.hass.loop.time()
+                + GATT_AUTHORIZATION_RECONNECT_SETTLE_SECONDS,
+            )
+            self._next_connect_after = max(
+                self._next_connect_after,
+                self._authorization_reconnect_after,
+            )
+            key = "gatt_authorization_reconnects_scheduled"
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0) + 1
+            )
+            if single_candidate_authorization_retry:
+                key = "single_candidate_gatt_authorization_reconnects_scheduled"
+                self._connect_attempt_stats[key] = (
+                    self._connect_attempt_stats.get(key, 0) + 1
+                )
+            _LOGGER.info(
+                "Amaran BLE proxy %s reported insufficient GATT authorization; "
+                "disposing GATT and retrying the %s candidate once after %.0fs",
+                failed_address,
+                "only reachable" if single_candidate_authorization_retry else "same",
+                GATT_AUTHORIZATION_RECONNECT_SETTLE_SECONDS,
+            )
+            return
         if failed_address in self._cccd_reconnect_pending:
             self._cccd_reconnect_pending.discard(failed_address)
             handoff_address = self._fresh_cccd_handoff_candidate(
@@ -804,7 +1222,7 @@ class AmaranBleController:
             self._uncached_recovery_attempted.discard(failed_address)
             self._service_cache_bypass.discard(failed_address)
             _LOGGER.info(
-                "Amaran BLE proxy %s uncached CCCD recovery failed; "
+                "Amaran BLE proxy %s uncached GATT recovery failed; "
                 "ending its eligibility for this candidate round",
                 failed_address,
             )
@@ -816,6 +1234,10 @@ class AmaranBleController:
                 err,
                 failure_reason=failure_reason,
             )
+        self._schedule_preopen_candidate_reprobe(
+            failed_address,
+            failure_reason=failure_reason,
+        )
         self._round_failed_candidates.add(failed_address)
         self._candidate_cursor = (addresses.index(failed_address) + 1) % len(addresses)
 
@@ -842,7 +1264,7 @@ class AmaranBleController:
         err: BaseException | None,
     ) -> bool:
         """Return whether one failed proxy should briefly yield to alternatives."""
-        if len(self._proxy_addresses()) > 1:
+        if len(self._candidate_round_members()) > 1:
             return True
         detail = self._format_error(err).lower()
         return (
@@ -868,10 +1290,10 @@ class AmaranBleController:
             return max(
                 DISCONNECT_TIMEOUT_CANDIDATE_COOLDOWN,
                 GATT_FAILURE_COOLDOWN
-                if len(self._proxy_addresses()) > 1
+                if len(self._candidate_round_members()) > 1
                 else SINGLE_CANDIDATE_FAILURE_COOLDOWN,
             )
-        if len(self._proxy_addresses()) <= 1:
+        if len(self._candidate_round_members()) <= 1:
             return SINGLE_CANDIDATE_FAILURE_COOLDOWN
         if (
             "timeout waiting for connect response" in detail
@@ -929,13 +1351,26 @@ class AmaranBleController:
     ) -> float:
         """Apply a bounded failure-streak cooldown and return its duration."""
         reason = failure_reason or self._candidate_failure_reason_for_error(err)
-        streak = self._candidate_failure_streak.get(address, 0) + 1
+        previous_reason = self._candidate_failure_reason.get(address)
+        # Reaching a later connection stage is real progress. Do not turn two
+        # physical-open failures plus one CCCD failure into a third post-open
+        # failure and quarantine the best candidate for minutes. The official
+        # client retries that new stage as a fresh recovery class.
+        streak = (
+            self._candidate_failure_streak.get(address, 0) + 1
+            if previous_reason == reason
+            else 1
+        )
         self._candidate_failure_streak[address] = streak
         self._candidate_failure_reason[address] = reason
         base = self._candidate_cooldown_seconds(err)
         if reason == "probation_disconnect":
             base = max(base, PROBATION_CONNECTION_COOLDOWN)
-        if len(self._proxy_addresses()) > 1:
+        preopen_failure = reason in {
+            "gatt_connect",
+            "gatt_or_service_discovery",
+        }
+        if len(self._candidate_round_members()) > 1 and not preopen_failure:
             duration = min(
                 base * (CANDIDATE_FAILURE_COOLDOWN_MULTIPLIER ** (streak - 1)),
                 CANDIDATE_FAILURE_COOLDOWN_MAX,
@@ -968,6 +1403,58 @@ class AmaranBleController:
             self._candidate_cursor = (addresses.index(address) + 1) % len(addresses)
         self._candidate_cooldown_until.pop(address, None)
         self._candidate_post_open_quarantine_until.pop(address, None)
+        self._candidate_probe_after_round.pop(address, None)
+        self._preferred_ownership_first_attempt_pending = False
+        self._authorization_recovery_attempted.clear()
+        self._authorization_reconnect_after = 0.0
+
+    def _schedule_preopen_candidate_reprobe(
+        self,
+        address: str,
+        *,
+        failure_reason: str | None,
+    ) -> None:
+        """Skip one round for a repeatedly failing non-preferred candidate."""
+        if not PREOPEN_FALLBACK_DEFERRAL_ENABLED:
+            return
+        if failure_reason not in {"gatt_connect", "gatt_or_service_discovery"}:
+            return
+        preferred = self._last_successful_proxy()
+        if preferred is None or preferred == address:
+            return
+        preferred_visible = self._has_fresh_ble_device(preferred)
+        if (
+            not preferred_visible
+            and preferred not in self._round_failed_candidates
+        ):
+            return
+        health = self._candidate_health_summary(address)
+        if int(health["gatt_failures"]) < PREOPEN_FALLBACK_MIN_FAILURES:
+            return
+
+        probe_after = (
+            self._candidate_round + PREOPEN_FALLBACK_SKIP_ROUNDS + 1
+        )
+        previous = self._candidate_probe_after_round.get(address, 0)
+        if previous >= probe_after:
+            return
+        self._candidate_probe_after_round[address] = probe_after
+        key = "preopen_fallback_round_deferrals"
+        self._connect_attempt_stats[key] = (
+            self._connect_attempt_stats.get(key, 0) + 1
+        )
+        if not preferred_visible:
+            key = "preopen_fallback_deferrals_after_preferred_attempt"
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0) + 1
+            )
+        _LOGGER.info(
+            "Deferring repeatedly failing Amaran BLE proxy %s until candidate "
+            "round %s while last trusted proxy %s remains eligible",
+            address,
+            probe_after,
+            preferred,
+        )
 
     def _record_candidate_health_outcome(self, address: str, outcome: str) -> None:
         """Keep a bounded, in-memory history of complete connection outcomes."""
@@ -1037,7 +1524,32 @@ class AmaranBleController:
 
     def _restart_candidate_round(self) -> None:
         """Restart a failed round from the last proxy proven stable."""
+        round_members = self._candidate_round_members()
+        broad_members = self._candidate_round_members(
+            include_deferred=True,
+            include_rssi_fallback=True,
+        )
+        focused_round = bool(
+            round_members
+            and broad_members
+            and round_members != broad_members
+        )
+        if focused_round and round_members.issubset(
+            self._round_failed_candidates
+        ):
+            self._rssi_focus_failed_rounds += 1
+            key = "rssi_focus_failed_rounds"
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0) + 1
+            )
+        elif not focused_round and self._rssi_focus_failed_rounds:
+            self._rssi_focus_failed_rounds = 0
+            key = "rssi_full_fallback_rounds"
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0) + 1
+            )
         self._candidate_round += 1
+        self._expire_candidate_probe_rounds()
         self._connect_failure_count = 0
         self._round_failed_candidates.clear()
         self._ignored_stored_proxy = None
@@ -1046,7 +1558,9 @@ class AmaranBleController:
         if preferred in addresses:
             self._candidate_cursor = addresses.index(preferred)
             key = "preferred_proxy_round_restarts"
-            self._connect_attempt_stats[key] = self._connect_attempt_stats.get(key, 0) + 1
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0) + 1
+            )
             preferred_cooldown = self._preferred_proxy_preopen_cooldown()
             if preferred_cooldown is not None:
                 _, cooldown = preferred_cooldown
@@ -1066,7 +1580,146 @@ class AmaranBleController:
                 "Restarting Amaran BLE candidate round from last stable proxy %s",
                 preferred,
             )
+
+        cleared_reachable_cooldowns: list[str] = []
+        for candidate in round_members:
+            if self._candidate_quarantine_remaining(candidate) is not None:
+                continue
+            self._candidate_post_open_quarantine_until.pop(candidate, None)
+            if self._candidate_failure_reason.get(candidate) not in {
+                "gatt_connect",
+                "gatt_or_service_discovery",
+            }:
+                continue
+            if self._candidate_cooldown_remaining(candidate) is None:
+                continue
+            self._candidate_cooldown_until.pop(candidate, None)
+            cleared_reachable_cooldowns.append(candidate)
+        if cleared_reachable_cooldowns:
+            key = "reachable_preopen_cooldown_overrides"
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0)
+                + len(cleared_reachable_cooldowns)
+            )
+            _LOGGER.info(
+                "Restarting Amaran BLE candidate round with %s reachable "
+                "pre-open cooldown(s) cleared after the recovery pause",
+                len(cleared_reachable_cooldowns),
+            )
         self._notify_diagnostics()
+
+    def _expire_candidate_probe_rounds(self) -> None:
+        """Release candidates whose bounded skipped round has elapsed."""
+        released = [
+            address
+            for address, probe_after in self._candidate_probe_after_round.items()
+            if probe_after <= self._candidate_round
+        ]
+        for address in released:
+            self._candidate_probe_after_round.pop(address, None)
+        if released:
+            key = "preopen_fallback_reprobes_released"
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0) + len(released)
+            )
+
+    def _candidate_round_members(
+        self,
+        *,
+        include_deferred: bool = False,
+        include_rssi_fallback: bool = False,
+    ) -> set[str]:
+        """Return candidates that can participate in the current connect round."""
+        configured = set(self._proxy_addresses())
+        now = self.hass.loop.time()
+        for address, seen_at in list(self._candidate_advertisement_seen_at.items()):
+            if address not in configured or now - seen_at > ADVERTISEMENT_MAX_AGE:
+                self._candidate_advertisement_seen_at.pop(address, None)
+        fresh = {
+            address
+            for address in configured
+            if self._has_fresh_ble_device(address)
+        } | set(self._candidate_advertisement_seen_at)
+        fresh_without_quarantine = {
+            address
+            for address in fresh
+            if self._candidate_post_open_quarantine_until.get(address, 0.0)
+            <= now
+        }
+        # Powered-off fixtures never advertise and therefore cannot record a
+        # connection failure. Once at least one fresh proxy exists, limit the
+        # round to those reachable candidates so offline fixtures cannot keep
+        # round open forever. Likewise, when at least one fresh candidate is
+        # eligible, do not let another candidate's post-open quarantine hold
+        # that round open. If every fresh candidate is quarantined, keep them
+        # as members so the connector waits instead of overriding quarantine.
+        # The local last-seen memory survives HA advertisement-history clearing,
+        # so a GATT resync cannot temporarily expand the round to powered-off
+        # configured fixtures. With no real recent advertisement at all, retain
+        # the configured set and wait for a fixture to reappear.
+        members = fresh_without_quarantine or fresh or configured
+        selected = members
+        if not include_deferred and fresh:
+            eligible = {
+                address
+                for address in members
+                if self._candidate_probe_after_round.get(address, 0)
+                <= self._candidate_round
+            }
+            # If every currently advertising fixture is deferred, failover
+            # must win over the skipped round because the preferred fixture
+            # disappeared.
+            selected = eligible or members
+        if (
+            not RSSI_FOCUS_ENABLED
+            or not fresh
+            or include_rssi_fallback
+            or self._rssi_focus_failed_rounds
+            >= RSSI_FOCUS_MAX_FAILED_ROUNDS
+        ):
+            return selected
+        return self._rssi_focus_members(selected) or selected
+
+    def _ownership_alternative_evidence(
+        self,
+        address: str,
+    ) -> tuple[set[str], set[str]]:
+        """Return active and expired alternatives attempted this ownership cycle."""
+        now = self.hass.loop.time()
+        active: set[str] = set()
+        expired: set[str] = set()
+        for alternative in self._ownership_attempted_candidates - {address}:
+            attempted_at = self._ownership_candidate_attempted_at.get(alternative)
+            # Missing timestamps can only come from pre-beta.92 test/runtime
+            # state. Fail closed rather than accidentally enabling a retry.
+            if (
+                attempted_at is None
+                or now - attempted_at
+                <= OWNERSHIP_ALTERNATIVE_EVIDENCE_SECONDS
+            ):
+                active.add(alternative)
+            else:
+                expired.add(alternative)
+        return active, expired
+
+    def _rssi_focus_members(self, members: set[str]) -> set[str] | None:
+        """Return a clearly stronger visible signal tier, when one exists."""
+        readings = {
+            address: rssi
+            for address in members
+            if isinstance((rssi := self._candidate_rssi(address)), int)
+        }
+        if len(readings) < 2:
+            return None
+        strongest = max(readings.values())
+        focused = {
+            address
+            for address, rssi in readings.items()
+            if rssi >= strongest - RSSI_FOCUS_WINDOW_DB
+        }
+        if not focused or focused == members:
+            return None
+        return focused
 
     def _preferred_proxy_preopen_cooldown(self) -> tuple[str, float] | None:
         """Return a last-stable proxy still cooling after a pre-open failure."""
@@ -1110,6 +1763,8 @@ class AmaranBleController:
             self._candidate_failure_reason.pop(candidate, None)
         self._candidate_failure_streak.pop(address, None)
         self._candidate_failure_reason.pop(address, None)
+        self._candidate_probe_after_round.clear()
+        self._rssi_focus_failed_rounds = 0
 
         if cleared_backoffs:
             key = "stable_mesh_backoff_resets"
@@ -1199,8 +1854,28 @@ class AmaranBleController:
 
     async def _connect_candidate_order(self, addresses: list[str]) -> list[str]:
         """Prefer candidates that Home Assistant can currently see advertising."""
+        round_members = self._candidate_round_members()
+        round_addresses = [
+            address for address in addresses if address in round_members
+        ]
+        if len(round_addresses) != len(addresses):
+            key = "candidate_round_member_filters"
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0) + 1
+            )
+            _LOGGER.debug(
+                "Amaran BLE candidate round %s restricted connect selection "
+                "from %s configured proxies to %s eligible members",
+                self._candidate_round,
+                len(addresses),
+                len(round_addresses),
+            )
+        addresses = round_addresses
+        if not addresses:
+            return []
         ordered = self._rotated_proxy_addresses(addresses)
         ordered = self._filter_candidate_cooldowns(ordered)
+        ordered = self._filter_candidate_probe_rounds(ordered)
         ordered = [
             address
             for address in ordered
@@ -1276,6 +1951,56 @@ class AmaranBleController:
                 "No fresh Amaran BLE proxy advertisements; waiting before GATT connect"
             )
         return []
+
+    def _preferred_ownership_first_candidate(
+        self,
+        addresses: list[str],
+    ) -> str | None:
+        """Use a fresh trusted proxy once at the start of an ownership cycle."""
+        if not self._preferred_ownership_first_attempt_pending:
+            return None
+        self._preferred_ownership_first_attempt_pending = False
+        preferred = self._last_successful_proxy()
+        if preferred is None or preferred not in addresses:
+            return None
+        now = self.hass.loop.time()
+        max_age = (
+            STARTUP_CONNECT_ADVERTISEMENT_MAX_AGE
+            if self._startup_scan_active()
+            else ADVERTISEMENT_MAX_AGE
+        )
+        if (
+            preferred in self._round_failed_candidates
+            or self._candidate_cooldown_until.get(preferred, 0.0) > now
+            or self._candidate_post_open_quarantine_until.get(preferred, 0.0) > now
+            or self._candidate_probe_after_round.get(preferred, 0)
+            > self._candidate_round
+            or not self._has_fresh_ble_device(preferred, max_age=max_age)
+        ):
+            return None
+        key = "preferred_proxy_ownership_first_attempts"
+        self._connect_attempt_stats[key] = (
+            self._connect_attempt_stats.get(key, 0) + 1
+        )
+        _LOGGER.info(
+            "Starting Amaran BLE ownership cycle with fresh last stable proxy %s",
+            preferred,
+        )
+        return preferred
+
+    def _filter_candidate_probe_rounds(self, addresses: list[str]) -> list[str]:
+        """Apply a bounded round skip without blocking the only visible node."""
+        eligible = [
+            address
+            for address in addresses
+            if self._candidate_probe_after_round.get(address, 0)
+            <= self._candidate_round
+        ]
+        if len(eligible) == len(addresses):
+            return addresses
+        if any(self._has_fresh_ble_device(address) for address in eligible):
+            return eligible
+        return addresses
 
     def _filter_candidate_cooldowns(self, addresses: list[str]) -> list[str]:
         """Return candidates that are not in a short failure cooldown."""
@@ -1461,14 +2186,14 @@ class AmaranBleController:
                     and self._service_info_is_fresh(service_info, max_age=max_age)
                 ),
                 {"addresses": tuple(sorted(candidates))},
-                bluetooth.BluetoothScanningMode.ACTIVE,
+                bluetooth.BluetoothScanningMode.PASSIVE,
                 DISCOVERY_TIMEOUT,
             )
         except TimeoutError:
             return None
         except Exception:
             _LOGGER.debug(
-                "Unable to process active advertisements for Amaran BLE proxy candidates",
+                "Unable to process passive advertisements for Amaran BLE proxy candidates",
                 exc_info=True,
             )
             return None
@@ -1509,8 +2234,8 @@ class AmaranBleController:
         return type(err).__name__
 
     def _filter_addresses(self) -> list[int]:
-        # This is the same whitelist emitted by Amaran Desktop's PyMeshSDK:
-        # the controller's local unicast address and All Nodes.
+        # This is the whitelist emitted by Amaran 1.0.71's libmesh SDK: the
+        # controller's local unicast address and All Nodes.
         return [DEFAULT_LOCAL_ADDRESS, 0xFFFF]
 
     def is_light_available(self, address: str) -> bool:
@@ -1616,6 +2341,8 @@ class AmaranBleController:
         self._last_status[src] = status
         self._last_status_seen[src] = self.hass.loop.time()
         self._status_miss_count[src] = 0
+        if self._mesh_available and self._control_enabled:
+            self._status_seen_in_session.add(src)
         if (fixture_state := self._fixture_states.get(src)) is not None:
             fixture_state.apply_status(status)
             self._notify_fixture_state(src)
@@ -1659,8 +2386,20 @@ class AmaranBleController:
             if not available:
                 self._notify_all_light_availability()
                 self._notify_diagnostics()
+            elif not self.status_notifications_supported():
+                self._apply_write_only_availability()
             return
         self._mesh_available = available
+        if available:
+            self._mesh_session_sequence += 1
+            self._mesh_session_started_at = self.hass.loop.time()
+            self._status_seen_in_session.clear()
+            self._status_miss_count.clear()
+            self._initial_status_census_complete = False
+        else:
+            self._mesh_session_started_at = None
+            self._status_seen_in_session.clear()
+            self._initial_status_census_complete = False
         for callback in list(self._mesh_callbacks):
             callback(available)
         self._notify_diagnostics()
@@ -1669,8 +2408,9 @@ class AmaranBleController:
                 self._set_light_available(light.mac, False)
         else:
             for light in self.config.lights:
-                self._set_light_available(light.mac, True)
-            self._expire_stale_lights()
+                self._set_light_available(light.mac, False)
+            if not self.status_notifications_supported():
+                self._apply_write_only_availability()
 
     def _handle_proxy_disconnect(
         self,
@@ -1799,6 +2539,10 @@ class AmaranBleController:
             "last_release_was_short": self._last_release_was_short,
             "last_release_connection_in_progress": self._last_release_in_progress,
             "connection_cleanup_in_progress": cleanup_in_progress,
+            "last_esphome_slot_release": self._last_esphome_slot_release,
+            "pending_esphome_slot_releases": sorted(
+                self._pending_esphome_slot_releases
+            ),
             "connection_stable": (
                 ready_session.stable if ready_session is not None else False
             ),
@@ -1827,16 +2571,51 @@ class AmaranBleController:
             "candidate_cooldowns": self._candidate_cooldowns(),
             "candidate_quarantines": self._candidate_quarantines(),
             "candidate_failure_reasons": dict(self._candidate_failure_reason),
+            "candidate_probe_after_round": dict(
+                self._candidate_probe_after_round
+            ),
+            "preferred_ownership_first_attempt_pending": (
+                self._preferred_ownership_first_attempt_pending
+            ),
+            "candidate_round_members": sorted(self._candidate_round_members()),
             "round_failed_candidates": sorted(self._round_failed_candidates),
             "candidate_cursor": self._candidate_cursor,
             "connect_failure_count": self._connect_failure_count,
             "ownership_cycle": self._ownership_cycle,
+            "ownership_attempted_candidates": sorted(
+                self._ownership_attempted_candidates
+            ),
+            "ownership_attempted_candidate_age_seconds": {
+                address: round(
+                    max(0.0, self.hass.loop.time() - attempted_at),
+                    1,
+                )
+                for address, attempted_at in (
+                    self._ownership_candidate_attempted_at.items()
+                )
+            },
             "candidate_round": self._candidate_round,
+            "rssi_focus_failed_rounds": self._rssi_focus_failed_rounds,
+            "rssi_focus_members": sorted(
+                self._rssi_focus_members(
+                    self._candidate_round_members(
+                        include_deferred=True,
+                        include_rssi_fallback=True,
+                    )
+                )
+                or ()
+            ),
             "connect_attempt_sequence": self._connect_attempt_sequence,
             "last_error": self._last_maintain_error,
             "last_error_hint": self._last_error_hint(),
             "connection_advice": self._connection_advice(),
             "status_notifications_supported": self.status_notifications_supported(),
+            "mesh_session_sequence": self._mesh_session_sequence,
+            "mesh_session_started_uptime_seconds": self._mesh_session_started_at,
+            "initial_status_census_complete": self._initial_status_census_complete,
+            "status_seen_in_session": [
+                f"0x{address:04x}" for address in sorted(self._status_seen_in_session)
+            ],
             "notification_backoffs": {
                 address: remaining
                 for address in self._proxy_addresses()
@@ -1848,7 +2627,143 @@ class AmaranBleController:
             "uncached_recovery_attempted": sorted(
                 self._uncached_recovery_attempted
             ),
+            "authorization_recovery_attempted": sorted(
+                self._authorization_recovery_attempted
+            ),
+            "authorization_reconnect_seconds": (
+                round(
+                    max(
+                        0.0,
+                        self._authorization_reconnect_after
+                        - self.hass.loop.time(),
+                    ),
+                    1,
+                )
+                or None
+            ),
+            "verified_gatt_cache_source": (
+                self._verified_gatt_cache_template[2]
+                if self._verified_gatt_cache_template is not None
+                else None
+            ),
+            "shared_gatt_cache_sources": dict(self._shared_gatt_cache_sources),
+            "bootstrap_gatt_cache_sources": sorted(
+                self._bootstrap_gatt_cache_sources
+            ),
+            "shared_gatt_cache_incompatible": sorted(
+                self._shared_gatt_cache_incompatible
+            ),
             "cache_mode_semantics": "requested_use_services_cache",
+            "connection_profile": {
+                "name": "esphome_beta106_beta94_cross_topology_baseline",
+                "esphome_allocation_release_gate": True,
+                "esphome_allocation_release_timeout_seconds": (
+                    ESPHOME_SLOT_RELEASE_CONFIRMATION_TIMEOUT
+                ),
+                "esphome_persistent_slot_recovery": True,
+                "esphome_slot_recovery_recheck_seconds": (
+                    ESPHOME_SLOT_RECOVERY_RECHECK_TIMEOUT
+                ),
+                "single_candidate_connector_slot_retry": (
+                    SINGLE_CANDIDATE_CONNECTOR_SLOT_RETRY_ENABLED
+                ),
+                "single_candidate_connector_slot_retry_min_failures": (
+                    SINGLE_CANDIDATE_CONNECTOR_SLOT_RETRY_MIN_FAILURES
+                ),
+                "single_candidate_connector_slot_retry_max_attempts": (
+                    SINGLE_CANDIDATE_CONNECTOR_SLOT_RETRY_MAX_ATTEMPTS
+                ),
+                "single_candidate_connector_slot_retry_membership": (
+                    "broad_visible_and_bounded_ownership_cycle"
+                ),
+                "ownership_alternative_evidence_seconds": (
+                    OWNERSHIP_ALTERNATIVE_EVIDENCE_SECONDS
+                ),
+                "preopen_scanner_cache_fallback_max_age_seconds": (
+                    PREOPEN_SCANNER_CACHE_FALLBACK_MAX_AGE
+                ),
+                "deferred_multi_candidate_recovery_delay_seconds": (
+                    DEFERRED_MULTI_CANDIDATE_RECOVERY_DELAY
+                ),
+                "advertisement_callback_scanning_mode": "passive",
+                "wait_for_source_scanner_passive": (
+                    WAIT_FOR_SOURCE_SCANNER_PASSIVE
+                ),
+                "candidate_policy": "all_fresh_visible_no_rssi_focus",
+                "preopen_fallback_deferral_enabled": (
+                    PREOPEN_FALLBACK_DEFERRAL_ENABLED
+                ),
+                "gatt_authorization_same_candidate_retry": (
+                    GATT_AUTHORIZATION_SAME_CANDIDATE_RETRY
+                ),
+                "single_candidate_gatt_authorization_same_candidate_retry": (
+                    SINGLE_CANDIDATE_GATT_AUTHORIZATION_RETRY
+                ),
+                "gatt_authorization_reconnect_settle_seconds": (
+                    GATT_AUTHORIZATION_RECONNECT_SETTLE_SECONDS
+                ),
+                "force_fresh_gatt_discovery": FORCE_FRESH_GATT_DISCOVERY,
+                "gatt_cache_scope": (
+                    "telink_mesh_proxy_bootstrap_then_mesh_verified"
+                ),
+                "prime_telink_mesh_proxy_bootstrap_cache": (
+                    PRIME_TELINK_MESH_PROXY_BOOTSTRAP_CACHE
+                ),
+                "telink_mesh_proxy_bootstrap_mtu": (
+                    TELINK_MESH_PROXY_BOOTSTRAP_MTU
+                ),
+                "share_verified_gatt_cache_between_candidates": (
+                    SHARE_VERIFIED_GATT_CACHE_BETWEEN_CANDIDATES
+                ),
+                "rssi_focus_enabled": RSSI_FOCUS_ENABLED,
+                "rssi_focus_window_db": RSSI_FOCUS_WINDOW_DB,
+                "rssi_focus_max_failed_rounds": (
+                    RSSI_FOCUS_MAX_FAILED_ROUNDS
+                ),
+                "notification_setup_timeout_seconds": (
+                    NOTIFICATION_SETUP_TIMEOUT
+                ),
+                "source_pre_connect_delay_seconds": OFFICIAL_CONNECT_DELAY,
+                "pre_connect_delay_seconds": ESPHOME_PRE_CONNECT_DELAY,
+                "source_physical_connect_timeout_seconds": (
+                    OFFICIAL_GATT_CONNECT_TIMEOUT
+                ),
+                "backend_connect_timeout_seconds": GATT_CLIENT_CONNECT_TIMEOUT,
+                "source_service_discovery_timeout_seconds": (
+                    OFFICIAL_SERVICE_DISCOVERY_TIMEOUT
+                ),
+                "combined_establish_deadline_seconds": (
+                    GATT_ESTABLISH_DEADLINE
+                ),
+                "preopen_advertisement_resync": (
+                    PREOPEN_ADVERTISEMENT_RESYNC
+                ),
+                "preopen_advertisement_resync_scanning_mode": (
+                    PREOPEN_ADVERTISEMENT_RESYNC_SCANNING_MODE
+                ),
+                "source_service_ready_delay_seconds": (
+                    OFFICIAL_SERVICE_READY_DELAY
+                ),
+                "service_ready_delay_seconds": (
+                    GATT_NOTIFICATION_SETTLE_SECONDS
+                ),
+                "proxy_filter_delay_seconds": PROXY_READY_DELAY,
+                "filter_status_deadline_seconds": FILTER_STATUS_TIMEOUT,
+                "requested_mtu": OFFICIAL_REQUESTED_MTU,
+                "mtu_managed_by_backend": True,
+                "post_connect_connection_params_enabled": (
+                    POST_CONNECT_CONNECTION_PARAMS_ENABLED
+                ),
+                "post_connect_min_interval_units": POST_CONNECT_MIN_INTERVAL,
+                "post_connect_max_interval_units": POST_CONNECT_MAX_INTERVAL,
+                "post_connect_latency": POST_CONNECT_LATENCY,
+                "post_connect_supervision_timeout_units": (
+                    POST_CONNECT_SUPERVISION_TIMEOUT
+                ),
+                "post_connect_params_request_timeout_seconds": (
+                    POST_CONNECT_PARAMS_REQUEST_TIMEOUT
+                ),
+            },
             "connect_attempt_stats": dict(self._connect_attempt_stats),
             "command_trace_semantics": (
                 "completed_mesh_writes_without_payload_or_key_material"
@@ -1887,7 +2802,7 @@ class AmaranBleController:
         ):
             return "proxy_out_of_slots"
         if "esp_gatt_conn_conn_cancel" in detail:
-            return "gatt_connect_cancelled"
+            return "proxy_slot_closing"
         if "timeout waiting for connect response" in detail or "timeouterror" in detail:
             return "gatt_timeout"
         if "esp_gatt_conn_fail_establish" in detail:
@@ -1924,10 +2839,11 @@ class AmaranBleController:
                 "The ESPHome Bluetooth Proxy reported no active connection slot; "
                 "wait for other BLE connections to finish or add another proxy."
             )
-        if hint == "gatt_connect_cancelled":
+        if hint == "proxy_slot_closing":
             return (
-                "The BLE backend cancelled this GATT establishment attempt; this does "
-                "not by itself mean the ESPHome proxy ran out of connection slots."
+                "The ESPHome proxy reported a connection-slot close race; the "
+                "integration will wait for the proxy's CLOSE event before handing "
+                "off to another fixture."
             )
         if hint == "gatt_authorization":
             return (
@@ -1966,6 +2882,9 @@ class AmaranBleController:
                         address
                     ),
                     "failure_reason": self._candidate_failure_reason.get(address),
+                    "probe_after_round": self._candidate_probe_after_round.get(
+                        address
+                    ),
                     "health_score": round(self._candidate_health_score(address), 3),
                     "health_samples": len(
                         self._candidate_health_history.get(address, ())
@@ -2025,23 +2944,45 @@ class AmaranBleController:
         if not self._mesh_available:
             return
         if not self.status_notifications_supported():
-            for light in self.config.lights:
-                self._set_light_available(light.mac, True)
+            self._apply_write_only_availability()
             return
         now = self.hass.loop.time()
         for light in self.config.lights:
+            if light.mesh_address not in self._status_seen_in_session:
+                self._set_light_available(light.mac, False)
+                continue
             seen_at = self._last_status_seen.get(light.mesh_address)
             if seen_at is None:
+                self._set_light_available(light.mac, False)
                 continue
             if now - seen_at > LIGHT_STATUS_UNAVAILABLE_SECONDS:
                 self._set_light_available(light.mac, False)
+
+    def _apply_write_only_availability(self) -> None:
+        """Use physical reachability when Mesh status notifications are unavailable."""
+        if not self._mesh_available:
+            return
+        for light in self.config.lights:
+            available = light.mac == self._active_proxy_address
+            if not available:
+                age = self._last_advertisement_age(light.mac)
+                available = (
+                    age is not None
+                    and age <= WRITE_ONLY_ADVERTISEMENT_MAX_AGE
+                )
+            self._set_light_available(light.mac, available)
 
     def _record_status_miss(self, mesh_address: int) -> None:
         """Record one missed status response and expire after repeated misses."""
         count = self._status_miss_count.get(mesh_address, 0) + 1
         self._status_miss_count[mesh_address] = count
         seen_at = self._last_status_seen.get(mesh_address)
-        if seen_at is None:
+        if (
+            seen_at is None
+            or mesh_address not in self._status_seen_in_session
+        ):
+            if (mac := self._mac_for_mesh_address(mesh_address)) is not None:
+                self._set_light_available(mac, False)
             self._notify_diagnostics()
             return
         stale_for = self.hass.loop.time() - seen_at
@@ -2201,18 +3142,36 @@ class AmaranBleController:
     async def _initial_refresh_all(self) -> None:
         """Request startup status a few times so every fixture can answer quickly."""
         if not self.status_notifications_supported():
+            self._initial_status_census_complete = True
+            self._apply_write_only_availability()
+            self._notify_diagnostics()
             return
-        seen_addresses: set[int] = set()
+        self._status_seen_in_session.clear()
+        self._status_miss_count.clear()
+        self._initial_status_census_complete = False
+        for light in self.config.lights:
+            self._set_light_available(light.mac, False)
         expected_addresses = {light.mesh_address for light in self.config.lights}
-        for attempt in range(INITIAL_STATUS_REFRESH_ATTEMPTS):
-            statuses = await self.async_refresh_all_statuses(
-                timeout=INITIAL_STATUS_WAIT,
+        try:
+            for attempt in range(INITIAL_STATUS_REFRESH_ATTEMPTS):
+                await self.async_refresh_all_statuses(
+                    timeout=INITIAL_STATUS_WAIT,
+                )
+                if expected_addresses and expected_addresses.issubset(
+                    self._status_seen_in_session
+                ):
+                    break
+                if attempt + 1 < INITIAL_STATUS_REFRESH_ATTEMPTS:
+                    await asyncio.sleep(INITIAL_STATUS_REFRESH_DELAY)
+        finally:
+            self._initial_status_census_complete = True
+            self._expire_stale_lights()
+            _LOGGER.info(
+                "Amaran BLE fixture census completed: %s/%s fixtures answered",
+                len(expected_addresses & self._status_seen_in_session),
+                len(expected_addresses),
             )
-            seen_addresses.update(statuses)
-            if expected_addresses and expected_addresses.issubset(seen_addresses):
-                break
-            if attempt + 1 < INITIAL_STATUS_REFRESH_ATTEMPTS:
-                await asyncio.sleep(INITIAL_STATUS_REFRESH_DELAY)
+            self._notify_diagnostics()
 
     def _schedule_notification_upgrade(self, session: _ProxySession) -> None:
         """Try to add status notifications only after write control is stable."""
@@ -2302,16 +3261,18 @@ class AmaranBleController:
                 self._notification_upgrade_tasks.pop(session.address, None)
 
     async def _enable_proxy_notifications(self, session: _ProxySession) -> None:
-        """Enable the required Proxy channel before optional Provisioning data."""
+        """Enable the Proxy channel required by an already provisioned Mesh."""
         if (
             session.client is None
             or session.proxy_data_out is None
             or session.notification_callback is None
         ):
             raise RuntimeError("Mesh Proxy notification channel is incomplete")
-        # The captured Sidus/Amaran sequence writes the Proxy Data Out CCCD
-        # (handle 0x30) before the Provisioning Data Out CCCD (handle 0x36).
         # Proxy notifications are mandatory for filter status and light state.
+        # This integration imports an existing Mesh and never provisions nodes,
+        # so it deliberately does not write the optional Provisioning Data Out
+        # CCCD. Some fixtures drop an otherwise healthy ESPHome GATT link with
+        # status 133 when that unused handle is enabled.
         if not session.notify_started:
             await asyncio.wait_for(
                 session.client.start_notify(
@@ -2322,29 +3283,6 @@ class AmaranBleController:
             )
             session.notify_started = True
             session.status_notifications_supported = True
-
-        if (
-            session.provisioning_data_out is not None
-            and not session.provisioning_notify_started
-        ):
-            try:
-                await asyncio.wait_for(
-                    session.client.start_notify(
-                        session.provisioning_data_out,
-                        self._ignore_provisioning_notification,
-                    ),
-                    timeout=NOTIFICATION_SETUP_TIMEOUT,
-                )
-                session.provisioning_notify_started = True
-            except Exception:
-                # Provisioned control does not consume PB-Out. Keep the already
-                # established Proxy-Out channel when this optional CCCD fails.
-                _LOGGER.debug(
-                    "Amaran BLE proxy %s could not enable optional Provisioning "
-                    "Data Out notifications",
-                    session.address,
-                    exc_info=True,
-                )
         self._notification_backoff_until.pop(session.address, None)
         self._notify_diagnostics()
 
@@ -2364,13 +3302,20 @@ class AmaranBleController:
         except Exception as err:  # noqa: BLE001 - reconnect owns the next retry.
             detail = self._format_error(err)
             if not isinstance(err, TimeoutError):
-                # A descriptor/GATT error means the link is already unusable.
-                # Keep same-candidate recovery for a silent CCCD timeout only.
+                # A descriptor/GATT error means the current link is unusable.
+                # Terminal descriptor errors rotate immediately. In
+                # particular, a remote authorization failure should not reuse
+                # the same fixture's stale ESPHome GATT state.
                 self._service_cache_bypass.discard(session.address)
                 self._cccd_reconnect_pending.discard(session.address)
                 self._cached_cccd_retry_attempted.discard(session.address)
                 self._uncached_recovery_attempted.discard(session.address)
                 self._notify_diagnostics()
+                if "insufficient authorization" in detail.lower():
+                    raise RuntimeError(
+                        "Mesh Proxy CCCD authorization error; dispose GATT and "
+                        f"rotate to another visible candidate: {detail}"
+                    ) from err
                 raise RuntimeError(
                     "Mesh Proxy CCCD notification setup failed with a terminal "
                     "GATT error; rotate candidates without same-candidate "
@@ -2422,6 +3367,8 @@ class AmaranBleController:
         self._cccd_reconnect_pending.discard(session.address)
         self._cached_cccd_retry_attempted.discard(session.address)
         self._uncached_recovery_attempted.discard(session.address)
+        self._authorization_recovery_attempted.discard(session.address)
+        self._authorization_reconnect_after = 0.0
         self._notify_diagnostics()
         return True
 
@@ -2455,7 +3402,7 @@ class AmaranBleController:
         *,
         wait_for_filter_status: bool,
     ) -> bool:
-        """Send Amaran Desktop's beacon and Mesh Proxy whitelist sequence."""
+        """Send the official beacon and two-step Mesh Proxy whitelist sequence."""
         if session.client is None or session.proxy_data_in is None:
             raise RuntimeError("Mesh Proxy write channel is incomplete")
 
@@ -2473,6 +3420,73 @@ class AmaranBleController:
             "secure network beacon",
         )
         await asyncio.sleep(PROXY_READY_DELAY)
+
+        # A write-only recovery session cannot observe either acknowledgement.
+        # Preserve control by sending both messages with the existing short
+        # spacing, but do not claim that the filter was confirmed.
+        if not wait_for_filter_status or filter_status_event is None:
+            await self._write_proxy_data(
+                session.client,
+                session.proxy_data_in,
+                mesh.build_set_filter_type_pdu(
+                    self.keys,
+                    sequence=self._next_sequence(),
+                    iv_index=session.iv_index,
+                ),
+                "proxy filter type",
+            )
+            await asyncio.sleep(PROXY_READY_DELAY)
+            await self._write_proxy_data(
+                session.client,
+                session.proxy_data_in,
+                mesh.build_add_addresses_pdu(
+                    self.keys,
+                    sequence=self._next_sequence(),
+                    addresses=self._filter_addresses(),
+                    iv_index=session.iv_index,
+                ),
+                "proxy add addresses",
+            )
+            return False
+
+        loop = asyncio.get_running_loop()
+        filter_deadline = loop.time() + FILTER_STATUS_TIMEOUT
+
+        async def wait_for_filter_status(stage: str) -> bool:
+            remaining = filter_deadline - loop.time()
+            if remaining <= 0:
+                _LOGGER.debug(
+                    "Amaran BLE proxy %s exhausted the official %.1fs filter "
+                    "deadline before %s confirmation",
+                    session.address,
+                    FILTER_STATUS_TIMEOUT,
+                    stage,
+                )
+                return False
+            try:
+                await asyncio.wait_for(
+                    filter_status_event.wait(),
+                    timeout=remaining,
+                )
+            except TimeoutError:
+                _LOGGER.debug(
+                    "Amaran BLE proxy %s did not report %s within the official "
+                    "%.1fs filter deadline",
+                    session.address,
+                    stage,
+                    FILTER_STATUS_TIMEOUT,
+                )
+                return False
+            _LOGGER.debug(
+                "Amaran BLE proxy %s confirmed %s",
+                session.address,
+                stage,
+            )
+            return True
+
+        # Amaran 1.0.71 advances this state machine only when a white-list
+        # Proxy Filter Status arrives. Sending Add Addresses early can race the
+        # first acknowledgement on a remote ESPHome Bluetooth proxy.
         await self._write_proxy_data(
             session.client,
             session.proxy_data_in,
@@ -2483,7 +3497,8 @@ class AmaranBleController:
             ),
             "proxy filter type",
         )
-        await asyncio.sleep(PROXY_READY_DELAY)
+        set_filter_confirmed = await wait_for_filter_status("Set Filter Type")
+        filter_status_event.clear()
         await self._write_proxy_data(
             session.client,
             session.proxy_data_in,
@@ -2495,23 +3510,22 @@ class AmaranBleController:
             ),
             "proxy add addresses",
         )
-
-        if not wait_for_filter_status:
+        if not set_filter_confirmed:
+            # The phone app tears down GATT here. A remote HA Bluetooth proxy
+            # can take much longer to reacquire that scarce slot, so retain the
+            # healthy link and finish the filter writes as an explicit,
+            # unconfirmed recovery path.
             return False
-        if filter_status_event is None:
-            return False
-        try:
-            await asyncio.wait_for(
-                filter_status_event.wait(),
-                timeout=FILTER_STATUS_TIMEOUT,
-            )
-        except TimeoutError:
-            return False
-        return True
+        return await wait_for_filter_status("Add Addresses")
 
     def _maintain_retry_delay(self, detail: str = "") -> int:
         """Return a bounded backoff delay after repeated BLE connect failures."""
         if self._full_candidate_round_failed():
+            round_members = self._candidate_round_members()
+            broad_round_members = self._candidate_round_members(
+                include_deferred=True,
+                include_rssi_fallback=True,
+            )
             if self._preopen_failure_storm_active():
                 _LOGGER.info(
                     "Amaran BLE pre-open failure storm detected after %s "
@@ -2520,6 +3534,29 @@ class AmaranBleController:
                     PREOPEN_STORM_RECOVERY_DELAY,
                 )
                 return PREOPEN_STORM_RECOVERY_DELAY
+            if len(round_members) == 1 and len(broad_round_members) > 1:
+                key = "deferred_multi_candidate_quiet_windows"
+                self._connect_attempt_stats[key] = (
+                    self._connect_attempt_stats.get(key, 0) + 1
+                )
+                _LOGGER.info(
+                    "Amaran BLE candidate deferral reduced a %s-proxy Mesh to "
+                    "one eligible proxy; preserving a %ss radio quiet window",
+                    len(broad_round_members),
+                    DEFERRED_MULTI_CANDIDATE_RECOVERY_DELAY,
+                )
+                return DEFERRED_MULTI_CANDIDATE_RECOVERY_DELAY
+            if (
+                len(round_members) == 1
+                and self._candidate_failure_reason.get(next(iter(round_members)))
+                == "gatt_connect"
+            ):
+                # With one powered fixture left there is no second address to
+                # rotate through. Retry after a short radio recovery window;
+                # the next attempt waits for a new passive advertisement
+                # instead of reusing the same BLEDevice indefinitely. Passive
+                # mode avoids overlapping an ESPHome active scan with GATT.
+                return SINGLE_CANDIDATE_ADVERTISEMENT_RESYNC_RETRY_DELAY
             if self._preferred_proxy_preopen_cooldown() is not None:
                 return PREFERRED_PROXY_GATT_RECOVERY_DELAY
             return RECOVERY_RETRY_DELAY
@@ -2527,6 +3564,8 @@ class AmaranBleController:
         if (
             "out of connection slots" in detail_lower
             or "allocation is still assigned" in detail_lower
+            or "slot recovery is still pending" in detail_lower
+            or "esp_gatt_conn_conn_cancel" in detail_lower
         ):
             return OUT_OF_SLOTS_RETRY_DELAY
         if (
@@ -2534,8 +3573,7 @@ class AmaranBleController:
         ):
             return GATT_ESTABLISH_RETRY_DELAY
         if (
-            "esp_gatt_conn_conn_cancel" in detail_lower
-            or "esp_gatt_conn_fail_establish" in detail_lower
+            "esp_gatt_conn_fail_establish" in detail_lower
             or "timeout waiting for connect response" in detail_lower
             or "timeouterror" in detail_lower
             or "disconnected after" in detail_lower
@@ -2552,14 +3590,16 @@ class AmaranBleController:
 
     def _preopen_failure_storm_active(self) -> bool:
         """Return whether two complete candidate rounds failed before GATT open."""
-        candidate_count = len(self._proxy_addresses())
+        candidate_count = len(
+            self._candidate_round_members(include_deferred=True)
+        )
         return bool(candidate_count) and self._consecutive_preopen_failures >= (
             candidate_count * PREOPEN_STORM_ROUNDS
         )
 
     def _full_candidate_round_failed(self) -> bool:
-        """Return whether every configured proxy has failed in this round."""
-        addresses = set(self._proxy_addresses())
+        """Return whether every currently reachable proxy failed this round."""
+        addresses = self._candidate_round_members()
         return bool(addresses) and addresses.issubset(self._round_failed_candidates)
 
     def _get_ble_device(self, proxy_address: str):
@@ -2569,16 +3609,189 @@ class AmaranBleController:
             connectable=True,
         )
 
+    def _scanner_cached_ble_device(
+        self,
+        proxy_address: str,
+        source: object,
+    ) -> object | None:
+        """Return the cached BLEDevice from the same connectable scanner path."""
+        scanner_devices_by_address = getattr(
+            bluetooth,
+            "async_scanner_devices_by_address",
+            None,
+        )
+        if scanner_devices_by_address is None or source is None:
+            return None
+        try:
+            try:
+                scanner_devices = scanner_devices_by_address(
+                    self.hass,
+                    proxy_address,
+                    connectable=True,
+                )
+            except TypeError:
+                scanner_devices = scanner_devices_by_address(self.hass, proxy_address)
+        except Exception:
+            _LOGGER.debug(
+                "Unable to inspect scanner-local BLEDevice cache for Amaran BLE proxy %s",
+                proxy_address,
+                exc_info=True,
+            )
+            return None
+
+        expected_source = str(source)
+        for scanner_device in scanner_devices:
+            scanner = getattr(scanner_device, "scanner", None)
+            scanner_source = getattr(scanner, "source", None)
+            ble_device = getattr(scanner_device, "ble_device", None)
+            if (
+                scanner_source is not None
+                and str(scanner_source) == expected_source
+                and ble_device is not None
+            ):
+                return ble_device
+        return None
+
+    @staticmethod
+    def _scanner_mode_value(scanner: object | None) -> str | None:
+        """Return a normalized read-only scanner mode."""
+        if scanner is None:
+            return None
+        mode = getattr(scanner, "current_mode", None)
+        value = getattr(mode, "value", mode)
+        if value is None:
+            return None
+        normalized = str(value).lower()
+        if normalized.endswith("active"):
+            return "active"
+        if normalized.endswith("passive"):
+            return "passive"
+        return normalized
+
+    @classmethod
+    def _scanner_mode_is_active(cls, scanner: object) -> bool:
+        """Return whether one read-only HA scanner snapshot reports active mode."""
+        return cls._scanner_mode_value(scanner) == "active"
+
+    def _source_scanner_snapshot(self, proxy_address: str) -> dict[str, object]:
+        """Return the source scanner mode without changing shared Bluetooth state."""
+        service_info = self._last_service_info(proxy_address)
+        source = getattr(service_info, "source", None)
+        scanner_by_source = getattr(bluetooth, "async_scanner_by_source", None)
+        scanner = (
+            scanner_by_source(self.hass, source)
+            if scanner_by_source is not None and source
+            else None
+        )
+        return {
+            "source": str(source) if source is not None else None,
+            "mode": self._scanner_mode_value(scanner),
+        }
+
+    async def _wait_for_source_scanner_passive(self, proxy_address: str) -> bool:
+        """Wait for an external scanner's active window without modifying it."""
+        scanner_by_source = getattr(bluetooth, "async_scanner_by_source", None)
+        service_info = self._last_service_info(proxy_address)
+        source = getattr(service_info, "source", None)
+        if scanner_by_source is None or not source:
+            return False
+        scanner = scanner_by_source(self.hass, source)
+        initial_mode = self._scanner_mode_value(scanner)
+        if scanner is None or initial_mode != "active":
+            return False
+
+        key = "scanner_active_waits"
+        self._connect_attempt_stats[key] = self._connect_attempt_stats.get(key, 0) + 1
+        started = self.hass.loop.time()
+        deadline = started + SCANNER_PASSIVE_WAIT_TIMEOUT
+        _LOGGER.info(
+            "Waiting for Bluetooth scanner %s to return to passive mode before "
+            "connecting Amaran BLE proxy %s",
+            source,
+            proxy_address,
+        )
+        final_mode = initial_mode
+        while self.hass.loop.time() < deadline and final_mode == "active":
+            await asyncio.sleep(SCANNER_MODE_POLL_INTERVAL)
+            final_mode = self._scanner_mode_value(scanner)
+
+        timed_out = final_mode == "active"
+        elapsed = max(0.0, self.hass.loop.time() - started)
+        trace = self._current_connect_trace
+        if trace is not None and trace.get("address") == proxy_address:
+            trace["scanner_wait"] = {
+                "initial_mode": initial_mode,
+                "final_mode": final_mode,
+                "elapsed_seconds": round(elapsed, 3),
+                "timed_out": timed_out,
+            }
+
+        if timed_out:
+            key = "scanner_active_wait_timeouts"
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0) + 1
+            )
+            _LOGGER.warning(
+                "Bluetooth scanner %s remained active for %.0fs; continuing "
+                "without modifying the shared scanner",
+                source,
+                SCANNER_PASSIVE_WAIT_TIMEOUT,
+            )
+        else:
+            key = "scanner_passive_wait_completions"
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0) + 1
+            )
+            await asyncio.sleep(POST_ACTIVE_SCAN_SETTLE_SECONDS)
+        return True
+
+    async def _prepare_ble_device_for_connect(
+        self,
+        proxy_address: str,
+        *,
+        resync_advertisement: bool,
+    ) -> object:
+        """Return a fresh BLEDevice after any shared active-scan window ends."""
+        ble_device = await self._async_get_ble_device(
+            proxy_address,
+            resync_advertisement=resync_advertisement,
+            allow_scan=True,
+        )
+        if ble_device is None:
+            raise RuntimeError(f"Amaran BLE device not found: {proxy_address}")
+
+        if (
+            WAIT_FOR_SOURCE_SCANNER_PASSIVE
+            and await self._wait_for_source_scanner_passive(proxy_address)
+        ):
+            ble_device = await self._async_get_ble_device(
+                proxy_address,
+                # The scanner has completed the requested active rediscovery
+                # and settled. Reuse its latest passive device instead of
+                # scheduling a second active window.
+                resync_advertisement=False,
+                allow_scan=True,
+            )
+            if ble_device is None:
+                raise RuntimeError(
+                    "Amaran BLE device did not advertise after the shared "
+                    f"scanner settled: {proxy_address}"
+                )
+        return ble_device
+
     async def _async_get_ble_device(
         self,
         proxy_address: str,
         *,
-        force_scan: bool = False,
+        resync_advertisement: bool = False,
         allow_scan: bool = False,
     ):
         """Return a connectable BLE device, doing a short on-demand scan if needed."""
         stale_ble_device = None
-        if not force_scan and (ble_device := self._get_ble_device(proxy_address)) is not None:
+        if (
+            not resync_advertisement
+            and (ble_device := self._get_ble_device(proxy_address)) is not None
+        ):
             if self._has_fresh_ble_device(proxy_address):
                 return ble_device
             stale_ble_device = ble_device
@@ -2589,6 +3802,27 @@ class AmaranBleController:
         if not allow_scan:
             return None
 
+        baseline_advertisement_time: float | None = None
+        baseline_info: object | None = None
+        baseline_source: object | None = None
+        if resync_advertisement:
+            baseline_info = self._last_service_info(proxy_address)
+            baseline_source = getattr(baseline_info, "source", None)
+            baseline_time = getattr(baseline_info, "time", None)
+            if isinstance(baseline_time, (int, float)):
+                baseline_advertisement_time = float(baseline_time)
+            clear_history = getattr(
+                bluetooth,
+                "async_clear_advertisement_history",
+                None,
+            )
+            if clear_history is not None:
+                clear_history(self.hass, proxy_address)
+                key = "advertisement_history_clears"
+                self._connect_attempt_stats[key] = (
+                    self._connect_attempt_stats.get(key, 0) + 1
+                )
+
         _LOGGER.debug(
             "Waiting up to %ss for Amaran BLE proxy advertisement from %s",
             DISCOVERY_TIMEOUT,
@@ -2598,47 +3832,135 @@ class AmaranBleController:
         while self.hass.loop.time() < deadline:
             timeout = max(0.1, min(1.0, deadline - self.hass.loop.time()))
             try:
+                scan_mode = (
+                    PREOPEN_ADVERTISEMENT_RESYNC_SCANNING_MODE
+                    if resync_advertisement
+                    else bluetooth.BluetoothScanningMode.PASSIVE
+                )
                 service_info = await bluetooth.async_process_advertisements(
                     self.hass,
                     lambda service_info: (
                         str(service_info.address).upper() == proxy_address
                         and self._service_info_is_connectable(service_info)
                         and self._service_info_is_fresh(service_info)
+                        and (
+                            baseline_advertisement_time is None
+                            or (
+                                isinstance(
+                                    getattr(service_info, "time", None),
+                                    (int, float),
+                                )
+                                and float(service_info.time)
+                                > baseline_advertisement_time
+                            )
+                        )
                     ),
                     {"address": proxy_address},
-                    bluetooth.BluetoothScanningMode.ACTIVE,
+                    scan_mode,
                     timeout,
                 )
             except TimeoutError:
-                if self._has_fresh_ble_device(proxy_address):
+                if (
+                    not resync_advertisement
+                    and self._has_fresh_ble_device(proxy_address)
+                ):
                     return self._get_ble_device(proxy_address)
                 continue
             except Exception:
                 _LOGGER.debug(
-                    "Unable to process active advertisements for Amaran BLE proxy %s",
+                    "Unable to process %s advertisements for Amaran BLE proxy %s",
+                    "active" if resync_advertisement else "passive",
                     proxy_address,
                     exc_info=True,
                 )
-                if self._has_fresh_ble_device(proxy_address):
+                if (
+                    not resync_advertisement
+                    and self._has_fresh_ble_device(proxy_address)
+                ):
                     return self._get_ble_device(proxy_address)
                 return None
 
             if not self._service_info_is_fresh(service_info):
                 age = self._service_info_age(service_info)
                 _LOGGER.debug(
-                    "Active scan returned stale Amaran BLE proxy advertisement for %s: age %s",
+                    "%s scan returned stale Amaran BLE proxy advertisement for %s: age %s",
+                    "Active" if resync_advertisement else "Passive",
                     proxy_address,
                     f"{age:.1f}s" if age is not None else "unknown",
                 )
                 await asyncio.sleep(0.1)
                 continue
 
-            ble_device = getattr(service_info, "device", None) or self._get_ble_device(proxy_address)
+            observed_time = getattr(service_info, "time", None)
+            if (
+                baseline_advertisement_time is not None
+                and (
+                    not isinstance(observed_time, (int, float))
+                    or float(observed_time) <= baseline_advertisement_time
+                )
+            ):
+                _LOGGER.debug(
+                    "Ignoring replayed Amaran BLE proxy advertisement for %s "
+                    "while waiting for a post-failure packet",
+                    proxy_address,
+                )
+                await asyncio.sleep(0.1)
+                continue
+
+            ble_device = getattr(service_info, "device", None) or self._get_ble_device(
+                proxy_address
+            )
             if ble_device is not None:
+                if resync_advertisement:
+                    await asyncio.sleep(ADVERTISEMENT_RESYNC_CONNECT_SETTLE_SECONDS)
                 return ble_device
             if self._has_fresh_ble_device(proxy_address):
+                if resync_advertisement:
+                    await asyncio.sleep(ADVERTISEMENT_RESYNC_CONNECT_SETTLE_SECONDS)
                 return self._get_ble_device(proxy_address)
             await asyncio.sleep(0.1)
+
+        if (
+            resync_advertisement
+            and baseline_info is not None
+            and self._service_info_is_connectable(baseline_info)
+            and self._service_info_is_fresh(
+                baseline_info,
+                max_age=PREOPEN_SCANNER_CACHE_FALLBACK_MAX_AGE,
+            )
+            and (
+                scanner_cached_device := self._scanner_cached_ble_device(
+                    proxy_address,
+                    baseline_source,
+                )
+            )
+            is not None
+        ):
+            baseline_age = self._service_info_age(baseline_info)
+            key = "preopen_scanner_cache_fallbacks"
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0) + 1
+            )
+            trace = self._current_connect_trace
+            if trace is not None and trace.get("address") == proxy_address:
+                trace["advertisement_resync_fallback"] = {
+                    "baseline_age_seconds": (
+                        round(baseline_age, 3) if baseline_age is not None else None
+                    ),
+                    "max_age_seconds": PREOPEN_SCANNER_CACHE_FALLBACK_MAX_AGE,
+                    "result": "same_scanner_cache",
+                    "source": str(baseline_source),
+                }
+            _LOGGER.info(
+                "No newer advertisement arrived for Amaran BLE proxy %s within "
+                "%ss; retaining the %.1fs-old BLEDevice from scanner %s",
+                proxy_address,
+                DISCOVERY_TIMEOUT,
+                baseline_age if baseline_age is not None else 0.0,
+                baseline_source,
+            )
+            await asyncio.sleep(ADVERTISEMENT_RESYNC_CONNECT_SETTLE_SECONDS)
+            return scanner_cached_device
 
         if stale_ble_device is not None:
             _LOGGER.debug(
@@ -2708,6 +4030,7 @@ class AmaranBleController:
             raise RuntimeError(
                 "Previous Amaran BLE GATT client is still being disposed"
             )
+        await self._wait_for_pending_esphome_slot_recovery()
 
         candidate_addresses = self._proxy_addresses()
         if not candidate_addresses:
@@ -2719,12 +4042,16 @@ class AmaranBleController:
                 "Unable to connect to any Amaran BLE mesh proxy: no candidates"
             )
 
-        # PyMeshSDK stops its private scanner as soon as one whitelisted node is
-        # selected. HA's scanner is shared, so leave it alone and reuse its fresh
-        # connectable BLEDevice. A short active scan remains the fallback when
-        # HA does not currently have fresh data for the selected candidate.
+        # The official libmesh stack stops its private scanner as soon as one
+        # whitelisted node is selected. HA's scanner is shared, so leave it alone
+        # and reuse its fresh connectable BLEDevice. If HA does not currently
+        # have fresh data, wait for a passive advertisement; requesting ACTIVE
+        # here can leave an ESPHome AUTO scanner active while that radio starts
+        # GATT.
         proxy_address = ordered_addresses[0]
         started = self.hass.loop.time()
+        self._ownership_attempted_candidates.add(proxy_address)
+        self._ownership_candidate_attempted_at[proxy_address] = started
         self._connect_attempt_sequence += 1
         attempt_id = self._connect_attempt_sequence
         candidate_health = self._candidate_health_summary(proxy_address)
@@ -2742,8 +4069,28 @@ class AmaranBleController:
             "advertisement_at_selection": self._advertisement_snapshot(
                 proxy_address
             ),
+            "scanner_at_selection": self._source_scanner_snapshot(proxy_address),
             "stages": {"candidate_selected": 0.0},
         }
+        connector_slot_retry = self._should_use_connector_slot_retry(
+            proxy_address
+        )
+        self._current_connect_trace["connector_internal_slot_retry"] = (
+            connector_slot_retry
+        )
+        self._current_connect_trace["connector_gatt_attempts"] = 0
+        if connector_slot_retry:
+            key = "connector_internal_slot_retry_sessions"
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0) + 1
+            )
+            _LOGGER.info(
+                "Using bleak-retry-connector slot-race recovery for the only "
+                "reachable Amaran BLE proxy %s after %s recent pre-open "
+                "failure(s)",
+                proxy_address,
+                candidate_health["gatt_failures"],
+            )
         _LOGGER.debug(
             "Amaran BLE ownership=%s round=%s attempt=%s selected %s "
             "health=%s samples=%s failed_before=%s",
@@ -2755,10 +4102,38 @@ class AmaranBleController:
             candidate_health["samples"],
             sorted(self._round_failed_candidates),
         )
+        slot_recovery_resync = self._esphome_slot_recovery_resync_pending
+        resync_advertisement = bool(
+            slot_recovery_resync
+            or (
+                PREOPEN_ADVERTISEMENT_RESYNC
+                and self._candidate_failure_reason.get(proxy_address)
+                == "gatt_connect"
+            )
+        )
+        if resync_advertisement:
+            key = (
+                "slot_recovery_advertisement_resyncs"
+                if slot_recovery_resync
+                else "gatt_failure_advertisement_resyncs"
+            )
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0) + 1
+            )
+            _LOGGER.info(
+                "Waiting for a fresh passive advertisement from Amaran BLE "
+                "proxy %s after %s",
+                proxy_address,
+                (
+                    "ESPHome slot recovery"
+                    if slot_recovery_resync
+                    else "a pre-open GATT failure"
+                ),
+            )
         try:
             session = await self._ensure_proxy(
                 proxy_address,
-                force_scan=False,
+                resync_advertisement=resync_advertisement,
             )
         except asyncio.CancelledError:
             elapsed = self.hass.loop.time() - started
@@ -2834,6 +4209,16 @@ class AmaranBleController:
                 "round_failed_before",
                 "advertisement_at_selection",
                 "advertisement_at_connect",
+                "scanner_at_selection",
+                "scanner_at_connect",
+                "scanner_wait",
+                "shared_gatt_cache_source",
+                "backend_cache_primed",
+                "connector_internal_slot_retry",
+                "connector_retry_round_members",
+                "connector_retry_broad_round_members",
+                "connector_retry_attempted_alternatives",
+                "connector_gatt_attempts",
             ):
                 item[key] = trace.get(key)
             item["requested_cache_mode"] = trace.get("requested_cache_mode")
@@ -2864,7 +4249,7 @@ class AmaranBleController:
         self._connect_attempt_history.append(item)
         _LOGGER.debug(
             "Amaran BLE ownership=%s round=%s attempt=%s candidate=%s "
-            "result=%s stage=%s cache=%s elapsed=%.3fs",
+            "result=%s stage=%s cache=%s scanner=%s waited=%s elapsed=%.3fs",
             item.get("ownership_cycle"),
             item.get("candidate_round"),
             item.get("attempt_id"),
@@ -2872,10 +4257,83 @@ class AmaranBleController:
             result,
             item.get("result_stage"),
             item.get("requested_cache_mode"),
+            (
+                item.get("scanner_at_connect", {}).get("mode")
+                if isinstance(item.get("scanner_at_connect"), Mapping)
+                else None
+            ),
+            isinstance(item.get("scanner_wait"), Mapping),
             elapsed,
         )
         self._notify_diagnostics()
         return str(item["result_stage"])
+
+    def _should_use_connector_slot_retry(self, address: str) -> bool:
+        """Use upstream slot-race retry only for one repeatedly failing node."""
+        if not SINGLE_CANDIDATE_CONNECTOR_SLOT_RETRY_ENABLED:
+            return False
+        health = self._candidate_health_summary(address)
+        if int(health["gatt_failures"]) < (
+            SINGLE_CANDIDATE_CONNECTOR_SLOT_RETRY_MIN_FAILURES
+        ):
+            return False
+
+        round_members = self._candidate_round_members()
+        broad_members = self._candidate_round_members(
+            include_deferred=True,
+            include_rssi_fallback=True,
+        )
+        attempted_alternatives, expired_alternatives = (
+            self._ownership_alternative_evidence(address)
+        )
+        trace = self._current_connect_trace
+        if trace is not None and trace.get("address") == address:
+            trace["connector_retry_round_members"] = sorted(round_members)
+            trace["connector_retry_broad_round_members"] = sorted(broad_members)
+            trace["connector_retry_attempted_alternatives"] = sorted(
+                attempted_alternatives
+            )
+            trace["connector_retry_expired_attempted_alternatives"] = sorted(
+                expired_alternatives
+            )
+
+        if broad_members != {address} or attempted_alternatives:
+            if attempted_alternatives:
+                key = "connector_internal_slot_retry_ownership_suppressions"
+                self._connect_attempt_stats[key] = (
+                    self._connect_attempt_stats.get(key, 0) + 1
+                )
+                _LOGGER.debug(
+                    "Keeping Amaran BLE proxy %s on the outer retry lifecycle; "
+                    "ownership cycle already attempted alternatives %s",
+                    address,
+                    sorted(attempted_alternatives),
+                )
+            elif round_members == {address} and address in broad_members:
+                key = "connector_internal_slot_retry_multi_candidate_suppressions"
+                self._connect_attempt_stats[key] = (
+                    self._connect_attempt_stats.get(key, 0) + 1
+                )
+                _LOGGER.debug(
+                    "Keeping Amaran BLE proxy %s on the outer retry lifecycle; "
+                    "broad round still has candidates %s",
+                    address,
+                    sorted(broad_members),
+                )
+            return False
+        if expired_alternatives:
+            key = "connector_internal_slot_retry_expired_ownership_releases"
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0) + 1
+            )
+            _LOGGER.debug(
+                "Allowing one-survivor recovery for Amaran BLE proxy %s; "
+                "ownership evidence for alternatives %s expired after %.0fs",
+                address,
+                sorted(expired_alternatives),
+                OWNERSHIP_ALTERNATIVE_EVIDENCE_SECONDS,
+            )
+        return True
 
     def _mark_connect_stage(self, address: str, stage: str) -> None:
         """Record one non-secret connection stage elapsed time."""
@@ -2923,10 +4381,12 @@ class AmaranBleController:
             return
         snapshot = self._advertisement_snapshot(address)
         trace["advertisement_at_connect"] = snapshot
+        scanner_snapshot = self._source_scanner_snapshot(address)
+        trace["scanner_at_connect"] = scanner_snapshot
         self._mark_connect_stage(address, "advertisement_ready")
         _LOGGER.debug(
             "Amaran BLE ownership=%s round=%s attempt=%s candidate=%s "
-            "advertisement age=%s rssi=%s source=%s connectable=%s",
+            "advertisement age=%s rssi=%s source=%s connectable=%s scanner=%s",
             trace.get("ownership_cycle"),
             trace.get("candidate_round"),
             trace.get("attempt_id"),
@@ -2935,7 +4395,506 @@ class AmaranBleController:
             snapshot.get("rssi"),
             snapshot.get("source"),
             snapshot.get("connectable"),
+            scanner_snapshot.get("mode"),
         )
+
+    @staticmethod
+    def _esphome_gatt_cache_context(
+        client: object,
+    ) -> tuple[object, int] | None:
+        """Return a structurally compatible ESPHome GATT cache when available."""
+        required_methods = (
+            "get_gatt_services_cache",
+            "set_gatt_services_cache",
+            "get_gatt_mtu_cache",
+            "set_gatt_mtu_cache",
+        )
+        candidates = (client, getattr(client, "_backend", None))
+        for backend in candidates:
+            if backend is None:
+                continue
+            cache = getattr(backend, "_cache", None)
+            address = getattr(backend, "_address_as_int", None)
+            if (
+                cache is not None
+                and isinstance(address, int)
+                and all(
+                    callable(getattr(cache, name, None))
+                    for name in required_methods
+                )
+            ):
+                return cache, address
+        return None
+
+    @staticmethod
+    def _address_as_int(address: str) -> int:
+        """Convert a normalized Bluetooth address to bleak-esphome's key."""
+        return int(address.replace(":", ""), 16)
+
+    @staticmethod
+    def _esphome_slot_device(client: object) -> object | None:
+        """Return the selected ESPHome slot tracker when the backend exposes it."""
+        backend = getattr(client, "_amaran_backend", None)
+        device = getattr(backend, "_bluetooth_device", None)
+        if device is None:
+            return None
+        if not isinstance(getattr(device, "ble_connections_free", None), int):
+            return None
+        if not isinstance(getattr(device, "ble_connections_limit", None), int):
+            return None
+        if not isinstance(getattr(device, "ble_allocations", None), list):
+            return None
+        return device
+
+    @staticmethod
+    def _esphome_slot_snapshot(
+        device: object,
+        target: int,
+    ) -> tuple[bool, int, int] | None:
+        """Return one authoritative ESPHome allocation snapshot when available."""
+        allocations = getattr(device, "ble_allocations", None)
+        free = getattr(device, "ble_connections_free", None)
+        limit = getattr(device, "ble_connections_limit", None)
+        if not isinstance(allocations, list):
+            return None
+        if not isinstance(free, int) or not isinstance(limit, int):
+            return None
+        return target in allocations, free, limit
+
+    def _record_esphome_slot_release(
+        self,
+        result: str,
+        *,
+        elapsed: float,
+        free: int | None = None,
+        limit: int | None = None,
+        target_allocated: bool | None = None,
+    ) -> None:
+        """Record redacted slot-release evidence for diagnostics."""
+        key = f"esphome_slot_release_{result}"
+        self._connect_attempt_stats[key] = (
+            self._connect_attempt_stats.get(key, 0) + 1
+        )
+        self._last_esphome_slot_release = {
+            "result": result,
+            "elapsed_seconds": round(elapsed, 3),
+            "free": free,
+            "limit": limit,
+            "target_allocated": target_allocated,
+        }
+        self._notify_diagnostics()
+
+    async def _wait_for_pending_esphome_slot_recovery(
+        self,
+        *,
+        timeout: float = ESPHOME_SLOT_RECOVERY_RECHECK_TIMEOUT,
+    ) -> bool:
+        """Block GATT until every timed-out ESPHome allocation is reusable."""
+        if not self._pending_esphome_slot_releases:
+            return False
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + max(0.0, timeout)
+
+        while self._pending_esphome_slot_releases:
+            recovered: list[tuple[str, int, int]] = []
+            unavailable_trackers: list[str] = []
+            pending_snapshot: tuple[bool, int, int] | None = None
+
+            for address, device in list(
+                self._pending_esphome_slot_releases.items()
+            ):
+                snapshot = self._esphome_slot_snapshot(
+                    device,
+                    self._address_as_int(address),
+                )
+                if snapshot is None:
+                    self._pending_esphome_slot_releases.pop(address, None)
+                    unavailable_trackers.append(address)
+                    continue
+
+                target_allocated, free, limit = snapshot
+                if not target_allocated and free > 0:
+                    self._pending_esphome_slot_releases.pop(address, None)
+                    recovered.append((address, free, limit))
+                    continue
+                if pending_snapshot is None:
+                    pending_snapshot = snapshot
+
+            if not self._pending_esphome_slot_releases:
+                elapsed = loop.time() - started
+                self._esphome_slot_recovery_resync_pending = True
+                if recovered:
+                    _address, free, limit = recovered[-1]
+                    self._record_esphome_slot_release(
+                        "recovered",
+                        elapsed=elapsed,
+                        free=free,
+                        limit=limit,
+                        target_allocated=False,
+                    )
+                else:
+                    self._record_esphome_slot_release(
+                        "tracker_unavailable",
+                        elapsed=elapsed,
+                    )
+                _LOGGER.info(
+                    "ESPHome cleared %s pending Amaran BLE slot allocation(s); "
+                    "waiting for a fresh passive advertisement before GATT",
+                    len(recovered) + len(unavailable_trackers),
+                )
+                return True
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                elapsed = loop.time() - started
+                target_allocated, free, limit = pending_snapshot or (
+                    None,
+                    None,
+                    None,
+                )
+                self._record_esphome_slot_release(
+                    "recovery_pending",
+                    elapsed=elapsed,
+                    free=free,
+                    limit=limit,
+                    target_allocated=target_allocated,
+                )
+                raise RuntimeError(
+                    "ESPHome BLE slot recovery is still pending; no new GATT "
+                    "request was sent"
+                )
+
+            await asyncio.sleep(
+                min(ESPHOME_SLOT_RELEASE_POLL_INTERVAL, remaining)
+            )
+
+    async def _wait_for_esphome_slot_release(
+        self,
+        client: object,
+        proxy_address: str,
+        *,
+        timeout: float = ESPHOME_SLOT_RELEASE_CONFIRMATION_TIMEOUT,
+    ) -> bool | None:
+        """Wait until ESPHome confirms that one target allocation is reusable."""
+        device = self._esphome_slot_device(client)
+        if device is None:
+            self._record_esphome_slot_release("unsupported", elapsed=0.0)
+            return None
+
+        target = self._address_as_int(proxy_address)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + max(0.0, timeout)
+
+        while True:
+            snapshot = self._esphome_slot_snapshot(device, target)
+            if snapshot is None:
+                self._record_esphome_slot_release(
+                    "tracker_unavailable",
+                    elapsed=loop.time() - started,
+                )
+                return None
+            target_allocated, free, limit = snapshot
+
+            if not target_allocated and free > 0:
+                self._pending_esphome_slot_releases.pop(proxy_address, None)
+                elapsed = loop.time() - started
+                self._record_esphome_slot_release(
+                    "confirmed",
+                    elapsed=elapsed,
+                    free=free,
+                    limit=limit,
+                    target_allocated=False,
+                )
+                if elapsed >= ESPHOME_SLOT_RELEASE_POLL_INTERVAL:
+                    _LOGGER.info(
+                        "ESPHome confirmed the Amaran BLE proxy slot release "
+                        "after %.1fs (free=%s/%s)",
+                        elapsed,
+                        free,
+                        limit,
+                    )
+                return True
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                elapsed = loop.time() - started
+                self._pending_esphome_slot_releases[proxy_address] = device
+                self._record_esphome_slot_release(
+                    "timeout",
+                    elapsed=elapsed,
+                    free=free,
+                    limit=limit,
+                    target_allocated=target_allocated,
+                )
+                guard_until = (
+                    self.hass.loop.time() + RELEASE_RECONNECT_COOLDOWN
+                )
+                self._next_connect_after = max(
+                    self._next_connect_after,
+                    guard_until,
+                )
+                self._release_guard_until = max(
+                    self._release_guard_until,
+                    guard_until,
+                )
+                _LOGGER.warning(
+                    "ESPHome did not confirm the Amaran BLE proxy slot release "
+                    "within %.0fs (target_allocated=%s, free=%s/%s); applying "
+                    "the bounded reconnect guard",
+                    timeout,
+                    target_allocated,
+                    free,
+                    limit,
+                )
+                return False
+
+            wait_for_free = getattr(device, "wait_for_ble_connections_free", None)
+            if free <= 0 and callable(wait_for_free):
+                try:
+                    await wait_for_free(remaining)
+                except TimeoutError:
+                    # Re-read the authoritative allocation snapshot once at
+                    # the deadline so diagnostics include its final state.
+                    continue
+            else:
+                await asyncio.sleep(
+                    min(ESPHOME_SLOT_RELEASE_POLL_INTERVAL, remaining)
+                )
+
+    @staticmethod
+    def _build_telink_mesh_proxy_bootstrap_services() -> object:
+        """Build the minimal verified Telink Mesh Proxy service table."""
+        from bleak.backends.characteristic import BleakGATTCharacteristic
+        from bleak.backends.descriptor import BleakGATTDescriptor
+        from bleak.backends.service import (
+            BleakGATTService,
+            BleakGATTServiceCollection,
+        )
+
+        services = BleakGATTServiceCollection()
+        service = BleakGATTService(
+            None,
+            TELINK_MESH_PROXY_SERVICE_HANDLE,
+            MESH_PROXY_SERVICE_UUID,
+        )
+        services.add_service(service)
+
+        def max_write_without_response() -> int:
+            return TELINK_MESH_PROXY_BOOTSTRAP_MTU - 3
+
+        data_in = BleakGATTCharacteristic(
+            None,
+            TELINK_MESH_PROXY_DATA_IN_HANDLE,
+            PROXY_DATA_IN_UUID,
+            ["write-without-response"],
+            max_write_without_response,
+            service,
+        )
+        services.add_characteristic(data_in)
+        data_out = BleakGATTCharacteristic(
+            None,
+            TELINK_MESH_PROXY_DATA_OUT_HANDLE,
+            PROXY_DATA_OUT_UUID,
+            ["notify"],
+            max_write_without_response,
+            service,
+        )
+        services.add_characteristic(data_out)
+        services.add_descriptor(
+            BleakGATTDescriptor(
+                None,
+                TELINK_MESH_PROXY_DATA_OUT_CCCD_HANDLE,
+                CCCD_UUID,
+                data_out,
+            )
+        )
+        return services
+
+    def _prime_telink_mesh_proxy_bootstrap_cache(
+        self,
+        client: object,
+        address: str,
+    ) -> bool:
+        """Prime a cold ESPHome backend with the standard Telink handles."""
+        if (
+            not PRIME_TELINK_MESH_PROXY_BOOTSTRAP_CACHE
+            or address in self._shared_gatt_cache_incompatible
+            or address in self._service_cache_bypass
+        ):
+            return False
+        context = self._esphome_gatt_cache_context(client)
+        if context is None:
+            return False
+        cache, backend_address = context
+        if (
+            cache.get_gatt_services_cache(backend_address)
+            and cache.get_gatt_mtu_cache(backend_address)
+        ):
+            return False
+
+        services = self._build_telink_mesh_proxy_bootstrap_services()
+        cache.set_gatt_services_cache(backend_address, services)
+        cache.set_gatt_mtu_cache(
+            backend_address,
+            TELINK_MESH_PROXY_BOOTSTRAP_MTU,
+        )
+        self._bootstrap_gatt_cache_sources.add(address)
+        trace = self._current_connect_trace
+        if trace is not None and trace.get("address") == address:
+            trace["backend_cache_primed"] = True
+            trace["bootstrap_gatt_cache_profile"] = "telink_mesh_proxy_v1"
+        key = "bootstrap_gatt_cache_primes"
+        self._connect_attempt_stats[key] = (
+            self._connect_attempt_stats.get(key, 0) + 1
+        )
+        _LOGGER.info(
+            "Primed Amaran BLE proxy %s with the standard Telink Mesh Proxy "
+            "GATT handles so ESPHome can skip cold MTU/service waiting",
+            address,
+        )
+        self._notify_diagnostics()
+        return True
+
+    def _prime_verified_gatt_cache(
+        self,
+        client: object,
+        address: str,
+    ) -> bool:
+        """Prime one ESPHome client from a Mesh-verified peer service table."""
+        template = self._verified_gatt_cache_template
+        context = self._esphome_gatt_cache_context(client)
+        if (
+            template is None
+            or context is None
+            or address in self._shared_gatt_cache_incompatible
+        ):
+            return False
+
+        services, mtu, source = template
+        cache, backend_address = context
+        if (
+            cache.get_gatt_services_cache(backend_address)
+            and cache.get_gatt_mtu_cache(backend_address)
+        ):
+            return False
+
+        cache.set_gatt_services_cache(backend_address, services)
+        cache.set_gatt_mtu_cache(backend_address, mtu)
+        self._shared_gatt_cache_sources[address] = source
+        trace = self._current_connect_trace
+        if trace is not None and trace.get("address") == address:
+            trace["shared_gatt_cache_source"] = source
+            trace["backend_cache_primed"] = True
+        key = "shared_gatt_cache_primes"
+        self._connect_attempt_stats[key] = self._connect_attempt_stats.get(key, 0) + 1
+        _LOGGER.info(
+            "Primed Amaran BLE proxy %s with the Mesh-verified GATT service "
+            "table from %s",
+            address,
+            source,
+        )
+        self._notify_diagnostics()
+        return True
+
+    def _discard_target_local_gatt_cache(
+        self,
+        client: object,
+        address: str,
+    ) -> bool:
+        """Discard only one target's process-local bleak-esphome cache."""
+        context = self._esphome_gatt_cache_context(client)
+        if context is None:
+            return False
+
+        cache, backend_address = context
+        clear_services = getattr(cache, "clear_gatt_services_cache", None)
+        clear_mtu = getattr(cache, "clear_gatt_mtu_cache", None)
+        if not callable(clear_services) or not callable(clear_mtu):
+            return False
+
+        clear_services(backend_address)
+        clear_mtu(backend_address)
+        self._shared_gatt_cache_sources.pop(address, None)
+        trace = self._current_connect_trace
+        if trace is not None and trace.get("address") == address:
+            trace["target_local_gatt_cache_cleared"] = True
+        key = "target_local_gatt_cache_clears"
+        self._connect_attempt_stats[key] = (
+            self._connect_attempt_stats.get(key, 0) + 1
+        )
+        return True
+
+    def _capture_verified_gatt_cache(self, session: _ProxySession) -> None:
+        """Retain and share the GATT topology only after Mesh login succeeds."""
+        if session.client is None:
+            return
+        context = self._esphome_gatt_cache_context(session.client)
+        if context is None:
+            return
+        cache, backend_address = context
+        services = cache.get_gatt_services_cache(backend_address)
+        mtu = cache.get_gatt_mtu_cache(backend_address)
+        if services is None or not isinstance(mtu, int) or mtu <= 0:
+            return
+
+        self._verified_gatt_cache_template = (services, mtu, session.address)
+        self._bootstrap_gatt_cache_sources.discard(session.address)
+        self._shared_gatt_cache_sources.pop(session.address, None)
+        self._shared_gatt_cache_incompatible.discard(session.address)
+        seeded = 0
+        for address in self._proxy_addresses():
+            if (
+                address == session.address
+                or address in self._shared_gatt_cache_incompatible
+            ):
+                continue
+            peer_address = self._address_as_int(address)
+            if (
+                cache.get_gatt_services_cache(peer_address)
+                and cache.get_gatt_mtu_cache(peer_address)
+            ):
+                continue
+            cache.set_gatt_services_cache(peer_address, services)
+            cache.set_gatt_mtu_cache(peer_address, mtu)
+            self._shared_gatt_cache_sources[address] = session.address
+            seeded += 1
+
+        if seeded:
+            key = "shared_gatt_cache_seeded_candidates"
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0) + seeded
+            )
+            _LOGGER.info(
+                "Shared Mesh-verified GATT service table from %s with %s "
+                "Amaran BLE proxy candidate(s)",
+                session.address,
+                seeded,
+            )
+            self._notify_diagnostics()
+
+    async def _discard_failed_shared_gatt_cache(
+        self,
+        session: _ProxySession,
+    ) -> None:
+        """Fall back to discovery if a peer's shared handle table is invalid."""
+        if session.address not in self._shared_gatt_cache_sources:
+            return
+        source = self._shared_gatt_cache_sources.pop(session.address)
+        self._shared_gatt_cache_incompatible.add(session.address)
+        self._service_cache_bypass.add(session.address)
+        await self._clear_gatt_service_cache(session)
+        key = "shared_gatt_cache_fallbacks"
+        self._connect_attempt_stats[key] = self._connect_attempt_stats.get(key, 0) + 1
+        _LOGGER.warning(
+            "Amaran BLE proxy %s failed after using the shared GATT service "
+            "table from %s; the next attempt will perform full service discovery",
+            session.address,
+            source,
+        )
+        self._notify_diagnostics()
 
     @staticmethod
     def _connect_result_stage(
@@ -2974,6 +4933,22 @@ class AmaranBleController:
         increment(f"cache_{cache_mode}_attempts")
         increment(f"cache_{cache_mode}_{result}")
         increment(f"stage_{result_stage}")
+        scanner_snapshot = item.get("scanner_at_connect")
+        scanner_mode = (
+            scanner_snapshot.get("mode")
+            if isinstance(scanner_snapshot, Mapping)
+            else None
+        )
+        if isinstance(scanner_mode, str) and scanner_mode:
+            increment(f"scanner_{scanner_mode}_attempts")
+            increment(f"scanner_{scanner_mode}_{result}")
+        if isinstance(item.get("scanner_wait"), Mapping):
+            increment("scanner_waited_attempts")
+            increment(f"scanner_waited_{result}")
+        if item.get("connector_internal_slot_retry"):
+            increment("connector_internal_slot_retry_results")
+        if "gatt retry budget exhausted" in str(item.get("detail", "")).lower():
+            increment("connector_internal_retry_budget_exhausted")
 
     def _track_candidate_cleanup_task(self, task: asyncio.Task) -> None:
         """Track cleanup that must survive the foreground connection attempt."""
@@ -2992,7 +4967,7 @@ class AmaranBleController:
         self,
         proxy_address: str,
         *,
-        force_scan: bool = False,
+        resync_advertisement: bool = False,
     ) -> _ProxySession:
         """Return a ready proxy session, reconnecting if needed."""
         async with self._session_lock(proxy_address):
@@ -3011,8 +4986,16 @@ class AmaranBleController:
             session = _ProxySession(proxy_address)
             self._sessions[proxy_address] = session
             try:
-                await self._connect_session(session, force_scan=force_scan)
+                await self._connect_session(
+                    session,
+                    resync_advertisement=resync_advertisement,
+                )
             except BaseException:
+                if (
+                    SHARE_VERIFIED_GATT_CACHE_BETWEEN_CANDIDATES
+                    and session.client is not None
+                ):
+                    await self._discard_failed_shared_gatt_cache(session)
                 await self._disconnect_session(proxy_address)
                 raise
             return session
@@ -3021,21 +5004,31 @@ class AmaranBleController:
         self,
         session: _ProxySession,
         *,
-        force_scan: bool = False,
+        resync_advertisement: bool = False,
     ) -> None:
         """Connect and prepare one BLE Mesh Proxy session."""
         proxy_address = session.address
         if not self._control_enabled:
             raise RuntimeError("Amaran BLE control switch is off")
 
-        ble_device = await self._async_get_ble_device(
+        ble_device = await self._prepare_ble_device_for_connect(
             proxy_address,
-            force_scan=force_scan,
-            allow_scan=True,
+            resync_advertisement=resync_advertisement,
         )
-        if ble_device is None:
-            raise RuntimeError(f"Amaran BLE device not found: {proxy_address}")
+        if resync_advertisement and self._esphome_slot_recovery_resync_pending:
+            self._esphome_slot_recovery_resync_pending = False
         self._mark_connect_advertisement_ready(proxy_address)
+
+        # The Android SDK waits one second between closing its local GATT object
+        # and connectGatt(). HA has already drained its remote client and the
+        # ESPHome allocation before _connect_session starts, so an additional
+        # delay is neither required nor useful on this transport.
+        if ESPHOME_PRE_CONNECT_DELAY > 0:
+            await asyncio.sleep(ESPHOME_PRE_CONNECT_DELAY)
+            self._mark_connect_stage(
+                proxy_address,
+                "esphome_pre_connect_delay_complete",
+            )
 
         def on_disconnect(disconnected_client: object) -> None:
             self.hass.loop.call_soon_threadsafe(
@@ -3055,6 +5048,14 @@ class AmaranBleController:
         )
         session.client = client
         self._mark_connect_stage(proxy_address, "gatt_services_ready")
+        _LOGGER.debug(
+            "Amaran BLE proxy %s connected with backend-managed MTU %s "
+            "(official Android request: %s)",
+            proxy_address,
+            getattr(client, "mtu_size", "unknown"),
+            OFFICIAL_REQUESTED_MTU,
+        )
+        await self._request_post_connect_connection_params(session)
 
         provisioning_data_out = client.services.get_characteristic(
             PROVISIONING_DATA_OUT_UUID
@@ -3070,6 +5071,8 @@ class AmaranBleController:
         filter_status_seen = asyncio.Event()
 
         def on_notify(_: int, data: bytearray) -> None:
+            if self._sessions.get(proxy_address) is not session:
+                return
             payload = bytes(data)
             if payload and (payload[0] & 0x3F) == mesh.PROXY_TYPE_PROXY_CONFIG:
                 filter_status_seen.set()
@@ -3110,8 +5113,8 @@ class AmaranBleController:
             notification_settle,
         )
 
-        # PyMeshSDK's ProxyInit enables PB-Out and Proxy-Out notifications before
-        # it sends the authenticated network beacon and proxy filter sequence.
+        # Amaran 1.0.71's Telink-derived ProxyInit enables PB-Out and Proxy-Out
+        # notifications before the authenticated beacon and filter sequence.
         await asyncio.sleep(notification_settle)
         notifications_ready = await self._enable_proxy_notifications_for_session(
             session
@@ -3144,10 +5147,87 @@ class AmaranBleController:
 
         session.mesh_ready = True
         session.connected_at = self.hass.loop.time()
+        if SHARE_VERIFIED_GATT_CACHE_BETWEEN_CANDIDATES:
+            self._capture_verified_gatt_cache(session)
         self._mark_connect_stage(proxy_address, "mesh_login_ready")
         _LOGGER.debug(
             "Amaran BLE proxy %s completed official-style Proxy login",
             proxy_address,
+        )
+
+    async def _request_post_connect_connection_params(
+        self,
+        session: _ProxySession,
+    ) -> None:
+        """Request a high-priority GATT link without requiring backend support."""
+        if not POST_CONNECT_CONNECTION_PARAMS_ENABLED:
+            return
+
+        client = session.client
+        setter = getattr(client, "set_connection_params", None)
+        if not callable(setter):
+            key = "connection_params_method_unavailable"
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0) + 1
+            )
+            _LOGGER.debug(
+                "Amaran BLE proxy %s backend has no connection-parameter API; "
+                "continuing with backend defaults",
+                session.address,
+            )
+            self._mark_connect_stage(
+                session.address,
+                "connection_params_method_unavailable",
+            )
+            return
+
+        key = "connection_params_requests"
+        self._connect_attempt_stats[key] = (
+            self._connect_attempt_stats.get(key, 0) + 1
+        )
+        self._mark_connect_stage(session.address, "connection_params_requested")
+        try:
+            async with asyncio.timeout(POST_CONNECT_PARAMS_REQUEST_TIMEOUT):
+                await setter(
+                    min_interval=POST_CONNECT_MIN_INTERVAL,
+                    max_interval=POST_CONNECT_MAX_INTERVAL,
+                    latency=POST_CONNECT_LATENCY,
+                    timeout=POST_CONNECT_SUPERVISION_TIMEOUT,
+                )
+        except Exception as err:  # noqa: BLE001 - advisory backend extension
+            key = "connection_params_request_failures"
+            self._connect_attempt_stats[key] = (
+                self._connect_attempt_stats.get(key, 0) + 1
+            )
+            self._mark_connect_stage(
+                session.address,
+                "connection_params_request_failed",
+            )
+            _LOGGER.warning(
+                "Amaran BLE proxy %s connection-parameter request failed; "
+                "continuing with backend defaults: %s",
+                session.address,
+                err,
+            )
+            return
+
+        key = "connection_params_request_returned"
+        self._connect_attempt_stats[key] = (
+            self._connect_attempt_stats.get(key, 0) + 1
+        )
+        self._mark_connect_stage(
+            session.address,
+            "connection_params_request_returned",
+        )
+        _LOGGER.debug(
+            "Amaran BLE proxy %s connection-parameter request returned "
+            "(interval=%d-%d, latency=%d, supervision_timeout=%d); backend "
+            "feature support remains authoritative",
+            session.address,
+            POST_CONNECT_MIN_INTERVAL,
+            POST_CONNECT_MAX_INTERVAL,
+            POST_CONNECT_LATENCY,
+            POST_CONNECT_SUPERVISION_TIMEOUT,
         )
 
     def _notification_settle_seconds(self, proxy_address: str) -> float:
@@ -3156,10 +5236,69 @@ class AmaranBleController:
             return GATT_NOTIFICATION_RECOVERY_SETTLE_SECONDS
         return GATT_NOTIFICATION_SETTLE_SECONDS
 
+    async def _drain_aborted_connect(self, tasks: list[asyncio.Task]) -> None:
+        """Drain cancelled GATT work without blocking every future connection."""
+        if not tasks:
+            return
+
+        try:
+            done, pending = await asyncio.wait(
+                tasks,
+                timeout=CLIENT_CLEANUP_DRAIN_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+                task.add_done_callback(self._consume_cleanup_task_result)
+            raise
+
+        for task in done:
+            self._consume_cleanup_task_result(task)
+
+        if not pending:
+            return
+
+        for task in pending:
+            task.cancel()
+            task.add_done_callback(self._consume_cleanup_task_result)
+
+        key = "forced_client_cleanup_cancellations"
+        self._connect_attempt_stats[key] = (
+            self._connect_attempt_stats.get(key, 0) + len(pending)
+        )
+        guard_until = self.hass.loop.time() + RELEASE_RECONNECT_COOLDOWN
+        self._next_connect_after = max(
+            self._next_connect_after,
+            guard_until,
+        )
+        self._release_guard_until = max(
+            self._release_guard_until,
+            guard_until,
+        )
+        _LOGGER.warning(
+            "Forced %s stalled Amaran BLE GATT cleanup task(s) to stop after "
+            "%.0fs; reconnecting after the proxy slot settle guard",
+            len(pending),
+            CLIENT_CLEANUP_DRAIN_TIMEOUT,
+        )
+        self._notify_diagnostics()
+
+    async def _finish_client_cleanup(
+        self,
+        disconnect_task: asyncio.Task,
+        client: object,
+        proxy_address: str,
+    ) -> None:
+        """Drain a slow disconnect and confirm its remote ESPHome allocation."""
+        await self._drain_aborted_connect([disconnect_task])
+        await self._wait_for_esphome_slot_release(client, proxy_address)
+
     @staticmethod
-    async def _drain_aborted_connect(tasks: list[asyncio.Task]) -> None:
-        """Consume completion from an aborted connect and its disconnect request."""
-        await asyncio.gather(*tasks, return_exceptions=True)
+    def _consume_cleanup_task_result(task: asyncio.Task) -> None:
+        """Consume completion from one detached GATT cleanup task."""
+        if not task.cancelled():
+            with contextlib.suppress(Exception):
+                task.exception()
 
     async def _establish_bleak_client(
         self,
@@ -3175,12 +5314,50 @@ class AmaranBleController:
             owned_client = client
             self._pending_clients[proxy_address] = client
 
+        def backend_created(backend: object) -> None:
+            if FORCE_FRESH_GATT_DISCOVERY:
+                self._discard_target_local_gatt_cache(backend, proxy_address)
+            elif SHARE_VERIFIED_GATT_CACHE_BETWEEN_CANDIDATES:
+                if not self._prime_verified_gatt_cache(backend, proxy_address):
+                    self._prime_telink_mesh_proxy_bootstrap_cache(
+                        backend,
+                        proxy_address,
+                    )
+
+        trace = self._current_connect_trace
+        connector_slot_retry = bool(
+            trace is not None
+            and trace.get("address") == proxy_address
+            and trace.get("connector_internal_slot_retry")
+        )
+
+        def connect_attempt_started() -> None:
+            current = self._current_connect_trace
+            if current is None or current.get("address") != proxy_address:
+                return
+            attempts = int(current.get("connector_gatt_attempts", 0)) + 1
+            current["connector_gatt_attempts"] = attempts
+            if connector_slot_retry:
+                key = "connector_internal_gatt_attempts"
+                self._connect_attempt_stats[key] = (
+                    self._connect_attempt_stats.get(key, 0) + 1
+                )
+
         try:
             cccd_recovery = proxy_address in self._service_cache_bypass
-            use_services_cache = not cccd_recovery
+            use_services_cache = not (
+                cccd_recovery or FORCE_FRESH_GATT_DISCOVERY
+            )
             if cccd_recovery:
-                cache_reason = "cccd_recovery"
+                cache_reason = (
+                    "gatt_connect_recovery"
+                    if self._candidate_failure_reason.get(proxy_address)
+                    == "gatt_connect"
+                    else "cccd_recovery"
+                )
                 self._uncached_recovery_attempted.add(proxy_address)
+            elif FORCE_FRESH_GATT_DISCOVERY:
+                cache_reason = "forced_fresh_discovery"
             else:
                 cache_reason = "normal_cache"
             self._set_connect_cache_decision(
@@ -3195,34 +5372,25 @@ class AmaranBleController:
                     proxy_address,
                     cache_reason,
                 )
-            establish_task = asyncio.create_task(
-                establish_connection(
-                    _AmaranBleakClient,
-                    ble_device,
-                    f"Amaran BLE {proxy_address}",
-                    disconnected_callback=disconnected_callback,
-                    max_attempts=CONNECT_MAX_ATTEMPTS,
-                    use_services_cache=use_services_cache,
-                    services=[
-                        MESH_PROVISIONING_SERVICE_UUID,
-                        MESH_PROXY_SERVICE_UUID,
-                    ],
-                    amaran_client_created=client_created,
+            return await establish_connection(
+                _AmaranBleakClient,
+                ble_device,
+                f"Amaran BLE {proxy_address}",
+                disconnected_callback=disconnected_callback,
+                max_attempts=CONNECT_MAX_ATTEMPTS,
+                use_services_cache=use_services_cache,
+                services=[
+                    MESH_PROVISIONING_SERVICE_UUID,
+                    MESH_PROXY_SERVICE_UUID,
+                ],
+                amaran_client_created=client_created,
+                amaran_backend_created=backend_created,
+                amaran_connect_attempt_started=connect_attempt_started,
+                amaran_retry_transient_slot_errors=connector_slot_retry,
+                amaran_retry_transient_slot_errors_max_attempts=(
+                    SINGLE_CANDIDATE_CONNECTOR_SLOT_RETRY_MAX_ATTEMPTS
                 ),
-                name=f"amaran_ble_establish_{proxy_address}",
             )
-            try:
-                return await asyncio.wait_for(
-                    establish_task,
-                    timeout=GATT_ESTABLISH_DEADLINE,
-                )
-            except TimeoutError as err:
-                if establish_task.done() and not establish_task.cancelled():
-                    raise
-                raise TimeoutError(
-                    "Amaran BLE GATT establish/service discovery exceeded "
-                    f"{GATT_ESTABLISH_DEADLINE:.0f}s for {proxy_address}"
-                ) from err
         except BaseException as err:
             if owned_client is not None:
                 await self._cleanup_client(owned_client, proxy_address)
@@ -3232,7 +5400,7 @@ class AmaranBleController:
                 self._pending_clients.pop(proxy_address, None)
 
     async def _cleanup_client(self, client: object, proxy_address: str) -> bool:
-        """Disconnect an owned client without inspecting HA or ESPHome internals."""
+        """Disconnect an owned client and confirm remote slot disposal when known."""
         disconnect_task = asyncio.create_task(
             client.disconnect(),
             name=f"amaran_ble_client_cleanup_{proxy_address}",
@@ -3243,20 +5411,39 @@ class AmaranBleController:
                 timeout=CLIENT_CLEANUP_TIMEOUT,
             )
         except TimeoutError:
-            cleanup_task = self._create_background_task(
-                self._drain_aborted_connect([disconnect_task]),
-                f"amaran_ble_client_cleanup_drain_{proxy_address}",
-            )
-            self._track_candidate_cleanup_task(cleanup_task)
+            if disconnect_task.done():
+                self._consume_cleanup_task_result(disconnect_task)
+                await self._wait_for_esphome_slot_release(
+                    client,
+                    proxy_address,
+                )
+            else:
+                cleanup_task = self._create_background_task(
+                    self._finish_client_cleanup(
+                        disconnect_task,
+                        client,
+                        proxy_address,
+                    ),
+                    f"amaran_ble_client_cleanup_drain_{proxy_address}",
+                )
+                self._track_candidate_cleanup_task(cleanup_task)
         except Exception:
             _LOGGER.debug(
                 "Unable to finish Amaran BLE client cleanup for %s",
                 proxy_address,
                 exc_info=True,
             )
+            await self._wait_for_esphome_slot_release(client, proxy_address)
+        else:
+            await self._wait_for_esphome_slot_release(client, proxy_address)
         return not self._client_is_connected(client)
 
-    async def _disconnect_session(self, proxy_address: str) -> None:
+    async def _disconnect_session(
+        self,
+        proxy_address: str,
+        *,
+        fast: bool = False,
+    ) -> None:
         """Disconnect one stored proxy session without taking its lock."""
         upgrade_task = self._notification_upgrade_tasks.pop(proxy_address, None)
         if (
@@ -3272,7 +5459,8 @@ class AmaranBleController:
         if client is None:
             return
         if (
-            session.provisioning_notify_started
+            not fast
+            and session.provisioning_notify_started
             and session.provisioning_data_out is not None
         ):
             with contextlib.suppress(Exception):
@@ -3281,7 +5469,7 @@ class AmaranBleController:
                     timeout=CLIENT_CLEANUP_TIMEOUT,
                 )
             session.provisioning_notify_started = False
-        if session.notify_started and session.proxy_data_out is not None:
+        if not fast and session.notify_started and session.proxy_data_out is not None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(
                     client.stop_notify(session.proxy_data_out),
@@ -3299,10 +5487,10 @@ class AmaranBleController:
             if proxy_address != keep:
                 await self._reset_proxy(proxy_address)
 
-    async def _reset_proxy(self, proxy_address: str) -> None:
+    async def _reset_proxy(self, proxy_address: str, *, fast: bool = False) -> None:
         """Drop one proxy session so the next command reconnects."""
         async with self._session_lock(proxy_address):
-            await self._disconnect_session(proxy_address)
+            await self._disconnect_session(proxy_address, fast=fast)
         if self._active_proxy_address == proxy_address:
             self._active_proxy_address = None
 

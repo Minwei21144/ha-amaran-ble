@@ -3,10 +3,13 @@
 這是一個非官方 Home Assistant 自訂整合，透過 Home Assistant Bluetooth 或
 ESPHome Bluetooth Proxy，在本機控制既有的 Amaran / Sidus BLE Mesh。
 
-目前預發行版本為 `v0.5.0-beta.4`。此版本只支援匯入已由 Amaran Desktop
+目前預發行版本為 `v0.5.0-beta.106`。此版本只支援匯入已由 Amaran Desktop
 或 Sidus Link 建立的 Mesh，不支援新增燈具配對或建立新 Mesh。
 
 [English documentation](README.md)
+
+[v0.5.0-beta.106 發行說明](docs/RELEASE-v0.5.0-beta.106.md) |
+[更新日誌](CHANGELOG.zh-TW.md)
 
 ## 已驗證燈具
 
@@ -27,6 +30,8 @@ Proxy 控制同一個既有 Sidus Mesh。
 - 總開關開啟時由 HA 接管並維持一條 Mesh Proxy 連線。
 - 總開關關閉時釋放 BLE，讓 Sidus Link 或 Amaran Desktop 恢復控制。
 - active proxy 失聯後自動切換其他已匯入燈具。
+- 只剩部分已匯入燈具通電時，依近期可達候選持續有界恢復；重新連線前會等待
+  ESPHome GATT slot 安全釋放。
 - 診斷資料會遮蔽 Mesh key，並將所有 MAC 轉為一致的匿名代號。
 
 ## HACS Custom Repository 安裝
@@ -37,7 +42,7 @@ Proxy 控制同一個既有 Sidus Mesh。
 2. 從選單進入 **自訂存放庫**。
 3. 輸入 `https://github.com/Minwei21144/ha-amaran-ble`。
 4. 類別選擇 **Integration**。
-5. 下載 Amaran BLE，選擇 `v0.5.0-beta.4`。若看不到預發行版本，請先在
+5. 下載 Amaran BLE，選擇 `v0.5.0-beta.106`。若看不到預發行版本，請先在
    HACS 對此 Repository 開啟 beta 版本追蹤。
 6. 重新啟動 Home Assistant。
 
@@ -105,6 +110,8 @@ Issue、Log、截圖或診斷附件。
 - HA 原生裝置頁自行決定控制項順序；除非顯示名稱前綴或使用自訂卡片，
   整合無法強制指定畫面順序。
 - 目前只有上表三種型號完成實機測試。
+- 目前已完成 1/4 與 2/4 部分燈具通電接管測試；3/4、4/4 與長時間
+  retention 壓力測試仍待補齊。
 - 這是逆向研究的社群整合，燈具或官方軟體更新後可能需要跟著調整。
 
 ## Debug

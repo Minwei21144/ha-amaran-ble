@@ -2,6 +2,33 @@
 
 All notable public changes are documented in this file.
 
+[繁體中文更新日誌](CHANGELOG.zh-TW.md)
+
+## 0.5.0-beta.106 - 2026-08-13
+
+- Define each connection round from recently reachable Mesh Proxy candidates,
+  so powered-off configured fixtures can no longer prevent a failed round from
+  restarting.
+- Wait for ESPHome to confirm that the previous remote GATT allocation is
+  reusable before opening another connection, with bounded cleanup and slot
+  recovery when confirmation is delayed.
+- Add fair candidate failover, bounded retries for a sole surviving proxy, and
+  90-second ownership evidence so stale candidates cannot permanently block
+  one-fixture recovery.
+- Preserve a 30-second radio quiet window when candidate deferral temporarily
+  makes a multi-proxy Mesh look like a single-candidate topology.
+- Recover from eligible GATT authorization failures with a fresh client and
+  retain a recent `BLEDevice` only from the same connectable scanner path.
+- Re-evaluate fixture availability for every Mesh session and keep fixtures
+  unavailable until they answer the current status census.
+- Retain the beta.4 light, brightness, 100 K CCT, G/M, hue and saturation
+  controls without changing the imported Mesh format.
+- Pass 208 offline tests. Physical qualification completed 10/10 two-of-four
+  acquisition cycles and 3/3 one-of-four cycles, with 92/92 Home Assistant
+  commands and 184/184 Mesh writes successful.
+- Keep this release marked as beta while three-of-four, four-of-four, clean
+  Core cold-start and extended retention qualification remain pending.
+
 ## 0.5.0-beta.4 - 2026-07-30
 
 - Add shared per-fixture color state synchronized between the standard light

@@ -8,6 +8,10 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+.codex-runtime/
+.codex-*/
+.codex-*.tar.gz
+.codex-*.py
 
 # Local exports and probe results may contain credentials or device addresses.
 amaran-ble-ha-config.json
