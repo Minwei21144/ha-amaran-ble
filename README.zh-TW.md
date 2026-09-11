@@ -3,13 +3,19 @@
 這是一個非官方 Home Assistant 自訂整合，透過 Home Assistant Bluetooth 或
 ESPHome Bluetooth Proxy，在本機控制既有的 Amaran / Sidus BLE Mesh。
 
-目前預發行版本為 `v0.5.0-beta.106`。此版本只支援匯入已由 Amaran Desktop
-或 Sidus Link 建立的 Mesh，不支援新增燈具配對或建立新 Mesh。
+目前 `main` 原始碼為 `0.5.0-beta.107`，修正 ESPHome scanner 重建後永久
+等待舊槽位追蹤物件的問題。已建立 Tag 的 HACS 預發行版本仍為
+`v0.5.0-beta.106`。兩者只支援匯入已由 Amaran Desktop 或 Sidus Link
+建立的 Mesh，不支援新增燈具配對或建立新 Mesh。
 
 [English documentation](README.md)
 
+[beta.107 變更與驗證](docs/RELEASE-v0.5.0-beta.107.md) |
 [v0.5.0-beta.106 發行說明](docs/RELEASE-v0.5.0-beta.106.md) |
 [更新日誌](CHANGELOG.zh-TW.md)
+
+GATT／CCCD 重連仍可能重試數分鐘；本次修正槽位追蹤問題，不保證固定時間
+內完成連線。
 
 ## 已驗證燈具
 
@@ -45,6 +51,10 @@ Proxy 控制同一個既有 Sidus Mesh。
 5. 下載 Amaran BLE，選擇 `v0.5.0-beta.106`。若看不到預發行版本，請先在
    HACS 對此 Repository 開啟 beta 版本追蹤。
 6. 重新啟動 Home Assistant。
+
+beta.106 的 HACS 發行包尚未包含 beta.107 修正。新 Release 建立前若要
+測試，請從 `main` 手動複製 `custom_components/amaran_ble` 至 HA 的
+`/config/custom_components/amaran_ble`，再重新啟動 Home Assistant。
 
 Home Assistant 最低版本為 `2026.7.0`。
 

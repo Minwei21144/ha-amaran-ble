@@ -465,6 +465,7 @@ class AmaranBleController:
         self._connect_attempt_stats: dict[str, int] = {}
         self._last_esphome_slot_release: dict[str, object] | None = None
         self._pending_esphome_slot_releases: dict[str, object] = {}
+        self._esphome_slot_recovery_started: float | None = None
         self._esphome_slot_recovery_resync_pending = False
         self._candidate_health_history: dict[str, deque[str]] = {}
         self._connect_attempt_sequence = 0
@@ -2543,6 +2544,12 @@ class AmaranBleController:
             "pending_esphome_slot_releases": sorted(
                 self._pending_esphome_slot_releases
             ),
+            "esphome_slot_recovery_wait_seconds": (
+                round(max(0.0, self.hass.loop.time() - self._esphome_slot_recovery_started), 1)
+                if self._pending_esphome_slot_releases
+                and self._esphome_slot_recovery_started is not None
+                else None
+            ),
             "connection_stable": (
                 ready_session.stable if ready_session is not None else False
             ),
@@ -2655,7 +2662,7 @@ class AmaranBleController:
             ),
             "cache_mode_semantics": "requested_use_services_cache",
             "connection_profile": {
-                "name": "esphome_beta106_beta94_cross_topology_baseline",
+                "name": "esphome_beta107_current_scanner_slot_recovery",
                 "esphome_allocation_release_gate": True,
                 "esphome_allocation_release_timeout_seconds": (
                     ESPHOME_SLOT_RELEASE_CONFIRMATION_TIMEOUT
@@ -2790,6 +2797,8 @@ class AmaranBleController:
         if not self._last_maintain_error:
             return None
         detail = self._last_maintain_error.lower()
+        if "slot recovery is still pending" in detail:
+            return "proxy_slot_recovery"
         if "insufficient authorization" in detail:
             return "gatt_authorization"
         if "cccd notification setup failed" in detail:
@@ -2816,6 +2825,12 @@ class AmaranBleController:
     def _connection_advice(self) -> str | None:
         """Return concise operator guidance for the latest connection problem."""
         hint = self._last_error_hint()
+        if hint == "proxy_slot_recovery":
+            return (
+                "Waiting for current ESPHome scanner allocation evidence; no new "
+                "GATT request is sent. Check last_esphome_slot_release.snapshot_status "
+                "and esphome_slot_recovery_wait_seconds."
+            )
         if hint == "gatt_timeout":
             return (
                 "Proxy can see advertisements but GATT connect is timing out; "
@@ -4461,6 +4476,59 @@ class AmaranBleController:
             return None
         return target in allocations, free, limit
 
+    def _current_esphome_slot_snapshot(
+        self, device: object, target: int,
+    ) -> tuple[tuple[bool, int, int] | None, str]:
+        """Resolve allocations through the currently registered source scanner."""
+        source = getattr(device, "mac_address", None)
+        scanner_by_source = getattr(bluetooth, "async_scanner_by_source", None)
+        if not source or not callable(scanner_by_source):
+            if getattr(device, "available", None) is False:
+                return None, "scanner_unavailable"
+            snapshot = self._esphome_slot_snapshot(device, target)
+            return snapshot, "backend_tracker" if snapshot is not None else "unsupported"
+
+        # ESPHome recreates its tracker on API reconnect. Never use the old
+        # backend's allocations once HA can resolve its current source.
+        try:
+            scanner = scanner_by_source(self.hass, str(source))
+            if scanner is None:
+                return None, "scanner_unavailable"
+            if str(getattr(scanner, "source", "")).upper() != str(source).upper():
+                return None, "source_mismatch"
+            current_device = getattr(scanner, "_bluetooth_device", None)
+            if getattr(current_device, "available", None) is False:
+                return None, "scanner_unavailable"
+            get_allocations = getattr(scanner, "get_allocations", None)
+            if not callable(get_allocations):
+                snapshot = self._esphome_slot_snapshot(current_device, target)
+                return snapshot, "current_tracker" if snapshot is not None else "allocations_unknown"
+            allocations = get_allocations()
+        except Exception:
+            _LOGGER.debug("Unable to read current ESPHome slot allocations", exc_info=True)
+            return None, "lookup_failed"
+
+        if allocations is None:
+            return None, "allocations_unknown"
+        if str(getattr(allocations, "adapter", "")).upper() != str(source).upper():
+            return None, "source_mismatch"
+        free = getattr(allocations, "free", None)
+        limit = getattr(allocations, "slots", None)
+        allocated = getattr(allocations, "allocated", None)
+        if (
+            not isinstance(free, int)
+            or not isinstance(limit, int)
+            or limit <= 0
+            or not 0 <= free <= limit
+            or not isinstance(allocated, list)
+        ):
+            return None, "allocations_unknown"
+        try:
+            targets = {self._address_as_int(address) for address in allocated}
+        except (AttributeError, TypeError, ValueError):
+            return None, "allocations_unknown"
+        return (target in targets, free, limit), "current_scanner"
+
     def _record_esphome_slot_release(
         self,
         result: str,
@@ -4469,6 +4537,8 @@ class AmaranBleController:
         free: int | None = None,
         limit: int | None = None,
         target_allocated: bool | None = None,
+        snapshot_status: str | None = None,
+        source: str | None = None,
     ) -> None:
         """Record redacted slot-release evidence for diagnostics."""
         key = f"esphome_slot_release_{result}"
@@ -4481,6 +4551,8 @@ class AmaranBleController:
             "free": free,
             "limit": limit,
             "target_allocated": target_allocated,
+            "snapshot_status": snapshot_status,
+            "source": source,
         }
         self._notify_diagnostics()
 
@@ -4493,6 +4565,9 @@ class AmaranBleController:
         if not self._pending_esphome_slot_releases:
             return False
 
+        if self._esphome_slot_recovery_started is None:
+            self._esphome_slot_recovery_started = self.hass.loop.time()
+
         loop = asyncio.get_running_loop()
         started = loop.time()
         deadline = started + max(0.0, timeout)
@@ -4501,17 +4576,26 @@ class AmaranBleController:
             recovered: list[tuple[str, int, int]] = []
             unavailable_trackers: list[str] = []
             pending_snapshot: tuple[bool, int, int] | None = None
+            snapshot_status: str | None = None
+            source: str | None = None
+            pending_status: str | None = None
+            pending_source: str | None = None
 
             for address, device in list(
                 self._pending_esphome_slot_releases.items()
             ):
-                snapshot = self._esphome_slot_snapshot(
+                snapshot, status = self._current_esphome_slot_snapshot(
                     device,
                     self._address_as_int(address),
                 )
+                source = getattr(device, "mac_address", None)
+                snapshot_status = status
                 if snapshot is None:
-                    self._pending_esphome_slot_releases.pop(address, None)
-                    unavailable_trackers.append(address)
+                    if status == "unsupported":
+                        self._pending_esphome_slot_releases.pop(address, None)
+                        unavailable_trackers.append(address)
+                    elif pending_status is None:
+                        pending_status, pending_source = status, source
                     continue
 
                 target_allocated, free, limit = snapshot
@@ -4519,12 +4603,14 @@ class AmaranBleController:
                     self._pending_esphome_slot_releases.pop(address, None)
                     recovered.append((address, free, limit))
                     continue
-                if pending_snapshot is None:
+                if pending_status is None:
                     pending_snapshot = snapshot
+                    pending_status, pending_source = status, source
 
             if not self._pending_esphome_slot_releases:
                 elapsed = loop.time() - started
                 self._esphome_slot_recovery_resync_pending = True
+                self._esphome_slot_recovery_started = None
                 if recovered:
                     _address, free, limit = recovered[-1]
                     self._record_esphome_slot_release(
@@ -4533,11 +4619,15 @@ class AmaranBleController:
                         free=free,
                         limit=limit,
                         target_allocated=False,
+                        snapshot_status=snapshot_status,
+                        source=source,
                     )
                 else:
                     self._record_esphome_slot_release(
                         "tracker_unavailable",
                         elapsed=elapsed,
+                        snapshot_status=snapshot_status,
+                        source=source,
                     )
                 _LOGGER.info(
                     "ESPHome cleared %s pending Amaran BLE slot allocation(s); "
@@ -4560,10 +4650,12 @@ class AmaranBleController:
                     free=free,
                     limit=limit,
                     target_allocated=target_allocated,
+                    snapshot_status=pending_status,
+                    source=pending_source,
                 )
                 raise RuntimeError(
                     "ESPHome BLE slot recovery is still pending; no new GATT "
-                    "request was sent"
+                    f"request was sent (snapshot={pending_status})"
                 )
 
             await asyncio.sleep(
@@ -4589,17 +4681,20 @@ class AmaranBleController:
         deadline = started + max(0.0, timeout)
 
         while True:
-            snapshot = self._esphome_slot_snapshot(device, target)
-            if snapshot is None:
+            snapshot, snapshot_status = self._current_esphome_slot_snapshot(device, target)
+            source = getattr(device, "mac_address", None)
+            if snapshot is None and snapshot_status == "unsupported":
                 self._record_esphome_slot_release(
                     "tracker_unavailable",
                     elapsed=loop.time() - started,
                 )
                 return None
-            target_allocated, free, limit = snapshot
+            target_allocated, free, limit = snapshot or (None, None, None)
 
-            if not target_allocated and free > 0:
+            if snapshot is not None and not target_allocated and free > 0:
                 self._pending_esphome_slot_releases.pop(proxy_address, None)
+                if not self._pending_esphome_slot_releases:
+                    self._esphome_slot_recovery_started = None
                 elapsed = loop.time() - started
                 self._record_esphome_slot_release(
                     "confirmed",
@@ -4607,6 +4702,8 @@ class AmaranBleController:
                     free=free,
                     limit=limit,
                     target_allocated=False,
+                    snapshot_status=snapshot_status,
+                    source=source,
                 )
                 if elapsed >= ESPHOME_SLOT_RELEASE_POLL_INTERVAL:
                     _LOGGER.info(
@@ -4622,12 +4719,16 @@ class AmaranBleController:
             if remaining <= 0:
                 elapsed = loop.time() - started
                 self._pending_esphome_slot_releases[proxy_address] = device
+                if self._esphome_slot_recovery_started is None:
+                    self._esphome_slot_recovery_started = self.hass.loop.time()
                 self._record_esphome_slot_release(
                     "timeout",
                     elapsed=elapsed,
                     free=free,
                     limit=limit,
                     target_allocated=target_allocated,
+                    snapshot_status=snapshot_status,
+                    source=source,
                 )
                 guard_until = (
                     self.hass.loop.time() + RELEASE_RECONNECT_COOLDOWN
@@ -4651,18 +4752,11 @@ class AmaranBleController:
                 )
                 return False
 
-            wait_for_free = getattr(device, "wait_for_ble_connections_free", None)
-            if free <= 0 and callable(wait_for_free):
-                try:
-                    await wait_for_free(remaining)
-                except TimeoutError:
-                    # Re-read the authoritative allocation snapshot once at
-                    # the deadline so diagnostics include its final state.
-                    continue
-            else:
-                await asyncio.sleep(
-                    min(ESPHOME_SLOT_RELEASE_POLL_INTERVAL, remaining)
-                )
+            # Do not wait on the retired tracker's future: a replacement
+            # scanner will notify a different object. Re-resolve the source.
+            await asyncio.sleep(
+                min(ESPHOME_SLOT_RELEASE_POLL_INTERVAL, remaining)
+            )
 
     @staticmethod
     def _build_telink_mesh_proxy_bootstrap_services() -> object:

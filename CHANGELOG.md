@@ -4,6 +4,30 @@ All notable public changes are documented in this file.
 
 [繁體中文更新日誌](CHANGELOG.zh-TW.md)
 
+## 0.5.0-beta.107 - 2026-09-11
+
+Source update; the latest tagged HACS release remains `v0.5.0-beta.106`.
+
+- Fix a permanent reconnect stall after an ESPHome API/scanner replacement:
+  slot recovery now reads allocations from the currently registered scanner
+  for the same source instead of waiting on the retired backend tracker.
+- Re-resolve the scanner during both initial GATT cleanup and pending slot
+  recovery. Do not wait on a retired tracker's free-slot notification future.
+- Keep the no-new-GATT guard when current allocation evidence is busy, missing,
+  malformed or from a different source. Do not treat unknown state as a free slot.
+- Add allocation snapshot status, source and cumulative recovery wait time to
+  diagnostics, with existing privacy redaction preserved.
+- Keep beta.106 candidate selection, Mesh login, GATT/CCCD timeouts, fixture
+  controls and imported configuration unchanged. No HA Bluetooth or Proxy
+  configuration changes are required.
+- Pass 219 offline tests, including 11 added regression tests. Three physical
+  control-switch cycles with two T2c fixtures online eventually recovered;
+  two succeeded on the first attempt, while the third needed nine attempts
+  and approximately six minutes before `connected` was observed.
+- This fixes the stale-tracker wait, not all GATT/CCCD failures. Reconnection
+  latency remains variable; multi-ESPHome-Proxy hardware is not qualified by
+  these tests. See the [validation notes](docs/RELEASE-v0.5.0-beta.107.md).
+
 ## 0.5.0-beta.106 - 2026-08-13
 
 - Define each connection round from recently reachable Mesh Proxy candidates,

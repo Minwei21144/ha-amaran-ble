@@ -8,7 +8,7 @@ from types import MappingProxyType
 import sys
 import types
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
 
 
 def _install_homeassistant_stubs() -> None:
@@ -5049,7 +5049,7 @@ class ControllerAvailabilityTest(unittest.TestCase):
 
         self.assertEqual(
             profile["name"],
-            "esphome_beta106_beta94_cross_topology_baseline",
+            "esphome_beta107_current_scanner_slot_recovery",
         )
         self.assertTrue(profile["esphome_allocation_release_gate"])
         self.assertTrue(profile["esphome_persistent_slot_recovery"])
@@ -5542,6 +5542,143 @@ class ControllerAvailabilityTest(unittest.TestCase):
             controller.hass.loop.time()
             + controller_module.RELEASE_RECONNECT_COOLDOWN,
         )
+
+    def _make_replaced_esphome_tracker(self):
+        controller, light = self._make_controller()
+        module = importlib.import_module("custom_components.amaran_ble.controller")
+        source = "AA:BB:CC:DD:EE:01"
+        old = types.SimpleNamespace(
+            mac_address=source, available=True,
+            ble_connections_free=2, ble_connections_limit=3,
+            ble_allocations=[controller._address_as_int(light.mac)],
+        )
+        allocations = types.SimpleNamespace(adapter=source, slots=3, free=3, allocated=[])
+        scanner = types.SimpleNamespace(
+            source=source,
+            _bluetooth_device=types.SimpleNamespace(available=True),
+            get_allocations=Mock(return_value=allocations),
+        )
+        return controller, light, module, old, scanner
+
+    def test_replaced_slot_tracker_recovers_even_if_old_available_is_true(self) -> None:
+        controller, light, module, old, scanner = self._make_replaced_esphome_tracker()
+        for available in (False, True):
+            with self.subTest(old_available=available), patch.object(
+                module.bluetooth, "async_scanner_by_source", return_value=scanner, create=True,
+            ) as lookup:
+                old.available = available
+                controller._pending_esphome_slot_releases[light.mac] = old
+                self.assertTrue(asyncio.run(controller._wait_for_pending_esphome_slot_recovery(timeout=0)))
+                self.assertFalse(controller._pending_esphome_slot_releases)
+                self.assertTrue(controller._esphome_slot_recovery_resync_pending)
+                self.assertIsNone(controller._esphome_slot_recovery_started)
+                lookup.assert_called_with(controller.hass, old.mac_address)
+                self.assertEqual(old.ble_connections_free, 2)
+                self.assertEqual(controller._last_esphome_slot_release["snapshot_status"], "current_scanner")
+
+    def test_initial_release_uses_current_scanner_not_stale_backend(self) -> None:
+        controller, light, module, old, scanner = self._make_replaced_esphome_tracker()
+        client = types.SimpleNamespace(_amaran_backend=types.SimpleNamespace(_bluetooth_device=old))
+        with patch.object(module.bluetooth, "async_scanner_by_source", return_value=scanner, create=True):
+            self.assertTrue(asyncio.run(controller._wait_for_esphome_slot_release(client, light.mac, timeout=0)))
+        self.assertFalse(controller._pending_esphome_slot_releases)
+        self.assertEqual(controller._last_esphome_slot_release["result"], "confirmed")
+
+    def test_current_busy_allocation_blocks_even_if_old_tracker_is_free(self) -> None:
+        controller, light, module, old, scanner = self._make_replaced_esphome_tracker()
+        old.ble_connections_free, old.ble_allocations = 3, []
+        scanner.get_allocations.return_value.free = 2
+        scanner.get_allocations.return_value.allocated = [light.mac]
+        controller._pending_esphome_slot_releases[light.mac] = old
+        with patch.object(module.bluetooth, "async_scanner_by_source", return_value=scanner, create=True):
+            with self.assertRaisesRegex(RuntimeError, "slot recovery is still pending"):
+                asyncio.run(controller._wait_for_pending_esphome_slot_recovery(timeout=0))
+        self.assertIn(light.mac, controller._pending_esphome_slot_releases)
+        self.assertTrue(controller._last_esphome_slot_release["target_allocated"])
+
+    def test_initial_release_rechecks_unknown_then_ready_scanner(self) -> None:
+        controller, light, module, old, scanner = self._make_replaced_esphome_tracker()
+        client = types.SimpleNamespace(_amaran_backend=types.SimpleNamespace(_bluetooth_device=old))
+        old.wait_for_ble_connections_free = AsyncMock(side_effect=AssertionError("retired tracker"))
+        free = scanner.get_allocations.return_value
+        busy = types.SimpleNamespace(adapter=old.mac_address, slots=3, free=0, allocated=[light.mac])
+        scanner.get_allocations.side_effect = [None, busy, free]
+        with patch.object(module.bluetooth, "async_scanner_by_source", return_value=scanner, create=True):
+            with patch.object(module, "ESPHOME_SLOT_RELEASE_POLL_INTERVAL", 0.001):
+                self.assertTrue(asyncio.run(controller._wait_for_esphome_slot_release(client, light.mac, timeout=1)))
+        old.wait_for_ble_connections_free.assert_not_awaited()
+        self.assertFalse(controller._pending_esphome_slot_releases)
+
+    def test_initial_release_unknown_snapshot_preserves_pending(self) -> None:
+        controller, light, module, old, scanner = self._make_replaced_esphome_tracker()
+        client = types.SimpleNamespace(_amaran_backend=types.SimpleNamespace(_bluetooth_device=old))
+        scanner.get_allocations.return_value = None
+        with patch.object(module.bluetooth, "async_scanner_by_source", return_value=scanner, create=True):
+            self.assertFalse(asyncio.run(controller._wait_for_esphome_slot_release(client, light.mac, timeout=0.001)))
+        self.assertIn(light.mac, controller._pending_esphome_slot_releases)
+        self.assertEqual(controller._last_esphome_slot_release["snapshot_status"], "allocations_unknown")
+
+    def test_unknown_current_allocations_never_use_old_free_slot(self) -> None:
+        controller, light, module, old, scanner = self._make_replaced_esphome_tracker()
+        old.ble_connections_free, old.ble_allocations = 3, []
+        invalid = types.SimpleNamespace(adapter=old.mac_address, slots=0, free=0, allocated=[])
+        wrong_source = types.SimpleNamespace(adapter="AA:BB:CC:DD:EE:02", slots=3, free=3, allocated=[])
+        for value, expected in ((None, "allocations_unknown"), (invalid, "allocations_unknown"), (wrong_source, "source_mismatch")):
+            with self.subTest(expected=expected):
+                scanner.get_allocations.return_value = value
+                controller._pending_esphome_slot_releases[light.mac] = old
+                with patch.object(module.bluetooth, "async_scanner_by_source", return_value=scanner, create=True):
+                    with self.assertRaisesRegex(RuntimeError, "slot recovery is still pending"):
+                        asyncio.run(controller._wait_for_pending_esphome_slot_recovery(timeout=0))
+                self.assertEqual(controller._last_esphome_slot_release["snapshot_status"], expected)
+                self.assertIsNone(controller._last_esphome_slot_release["free"])
+
+    def test_missing_scanner_blocks_then_recovers_after_registration(self) -> None:
+        controller, light, module, old, scanner = self._make_replaced_esphome_tracker()
+        controller._pending_esphome_slot_releases[light.mac] = old
+        with patch.object(module.bluetooth, "async_scanner_by_source", return_value=None, create=True) as lookup:
+            with self.assertRaisesRegex(RuntimeError, "scanner_unavailable"):
+                asyncio.run(controller._wait_for_pending_esphome_slot_recovery(timeout=0))
+            controller.hass.loop._time += 120
+            self.assertEqual(controller.diagnostic_state()["esphome_slot_recovery_wait_seconds"], 120)
+            lookup.return_value = scanner
+            self.assertTrue(asyncio.run(controller._wait_for_pending_esphome_slot_recovery(timeout=0)))
+        self.assertFalse(controller._pending_esphome_slot_releases)
+
+    def test_slot_recovery_refreshes_scanner_during_same_wait(self) -> None:
+        controller, light, module, old, scanner = self._make_replaced_esphome_tracker()
+        controller._pending_esphome_slot_releases[light.mac] = old
+        with patch.object(module.bluetooth, "async_scanner_by_source", side_effect=[None, scanner], create=True):
+            with patch.object(module, "ESPHOME_SLOT_RELEASE_POLL_INTERVAL", 0.001):
+                self.assertTrue(asyncio.run(controller._wait_for_pending_esphome_slot_recovery(timeout=1)))
+        self.assertFalse(controller._pending_esphome_slot_releases)
+
+    def test_slot_lookup_failure_remains_pending_without_gatt(self) -> None:
+        controller, light, module, old, scanner = self._make_replaced_esphome_tracker()
+        controller._pending_esphome_slot_releases[light.mac] = old
+        controller._ensure_proxy = AsyncMock()
+        original_wait = controller._wait_for_pending_esphome_slot_recovery
+        controller._wait_for_pending_esphome_slot_recovery = lambda: original_wait(timeout=0)
+        with patch.object(module.bluetooth, "async_scanner_by_source", side_effect=RuntimeError("not ready"), create=True):
+            with self.assertRaisesRegex(RuntimeError, "lookup_failed"):
+                asyncio.run(controller._connect_active_proxy_locked())
+        controller._ensure_proxy.assert_not_awaited()
+        self.assertIn(light.mac, controller._pending_esphome_slot_releases)
+
+    def test_recovery_does_not_accept_different_proxy_scanner(self) -> None:
+        controller, light, module, old, scanner = self._make_replaced_esphome_tracker()
+        scanner.source = "AA:BB:CC:DD:EE:02"
+        controller._pending_esphome_slot_releases[light.mac] = old
+        with patch.object(module.bluetooth, "async_scanner_by_source", return_value=scanner, create=True):
+            with self.assertRaisesRegex(RuntimeError, "source_mismatch"):
+                asyncio.run(controller._wait_for_pending_esphome_slot_recovery(timeout=0))
+        scanner.get_allocations.assert_not_called()
+
+    def test_slot_recovery_hint_explains_no_new_gatt(self) -> None:
+        controller, _light = self._make_controller()
+        controller._last_maintain_error = "ESPHome BLE slot recovery is still pending"
+        self.assertEqual(controller._last_error_hint(), "proxy_slot_recovery")
+        self.assertIn("no new GATT", controller._connection_advice())
 
     def test_pending_esphome_slot_recovery_blocks_gatt_until_reusable(self) -> None:
         controller, light = self._make_controller()

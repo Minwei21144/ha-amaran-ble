@@ -9,13 +9,19 @@ An unofficial Home Assistant custom integration for locally controlling an
 existing Amaran/Sidus BLE Mesh through Home Assistant Bluetooth or an ESPHome
 Bluetooth Proxy.
 
-> **Beta:** `v0.5.0-beta.106` imports an existing Sidus Mesh; it does not
-> provision a new fixture or create a new Mesh.
+> **Source beta:** `main` contains `0.5.0-beta.107`, which fixes a permanent
+> stale-slot recovery wait after an ESPHome scanner replacement. The latest
+> tagged HACS release remains `v0.5.0-beta.106`. Both import an existing Sidus
+> Mesh; they do not provision a new fixture or create a new Mesh.
 
 [繁體中文文檔](README.zh-TW.md)
 
+[beta.107 changes and validation](docs/RELEASE-v0.5.0-beta.107.md) |
 [v0.5.0-beta.106 release notes](docs/RELEASE-v0.5.0-beta.106.md) |
 [Changelog](CHANGELOG.md)
+
+GATT/CCCD reconnection retries can still take several minutes. This update
+addresses stale slot tracking, not a guaranteed connection-time limit.
 
 ![Amaran BLE controls in Home Assistant](docs/images/amaran-ble-dashboard.png)
 
@@ -71,6 +77,9 @@ the default HACS catalog.
 5. Download **Amaran BLE** and select `v0.5.0-beta.106`. If pre-releases are
    hidden, enable beta versions for this HACS repository first.
 6. Restart Home Assistant.
+
+The beta.107 source fix is not included in the beta.106 HACS release. Use the
+manual installation below from `main` to test it before a new release is tagged.
 
 [![Open your Home Assistant instance and add this repository to HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Minwei21144&repository=ha-amaran-ble&category=integration)
 
