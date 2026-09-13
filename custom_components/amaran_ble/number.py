@@ -6,11 +6,13 @@ from enum import Enum
 from typing import Any
 
 from homeassistant.components.number import (
+    DOMAIN as NUMBER_DOMAIN,
     NumberEntity,
     NumberMode,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .color_state import (
@@ -41,6 +43,18 @@ class AdvancedControl(str, Enum):
     SATURATION = "saturation"
 
 
+def supported_controls(config: AmaranLightConfig) -> list[AdvancedControl]:
+    """Return the numeric controls one fixture actually supports, in order."""
+    controls = [AdvancedControl.BRIGHTNESS]
+    if config.supports_cct:
+        controls.append(AdvancedControl.COLOR_TEMPERATURE)
+    if config.supports_gm:
+        controls.append(AdvancedControl.GREEN_MAGENTA)
+    if config.supports_hs:
+        controls.extend((AdvancedControl.HUE, AdvancedControl.SATURATION))
+    return controls
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -48,39 +62,40 @@ async def async_setup_entry(
 ) -> None:
     """Set up advanced numeric controls for configured fixtures."""
     controller: AmaranBleController = hass.data[DOMAIN][entry.entry_id]
-    entities: list[AmaranBleColorNumber] = []
-    for config in controller.config.lights:
-        entities.extend(
-            (
-                AmaranBleColorNumber(
-                    controller,
-                    config,
-                    AdvancedControl.BRIGHTNESS,
-                ),
-                AmaranBleColorNumber(
-                    controller,
-                    config,
-                    AdvancedControl.COLOR_TEMPERATURE,
-                ),
-            )
-        )
-        if config.supports_gm:
-            entities.append(
-                AmaranBleColorNumber(
-                    controller,
-                    config,
-                    AdvancedControl.GREEN_MAGENTA,
-                )
-            )
-        if config.supports_hs:
-            entities.extend(
-                AmaranBleColorNumber(controller, config, control)
-                for control in (
-                    AdvancedControl.HUE,
-                    AdvancedControl.SATURATION,
-                )
-            )
+    entities = [
+        AmaranBleColorNumber(controller, config, control)
+        for config in controller.config.lights
+        for control in supported_controls(config)
+    ]
+    _remove_stale_controls(
+        hass,
+        entry,
+        {entity.unique_id for entity in entities},
+    )
     async_add_entities(entities)
+
+
+def _remove_stale_controls(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    expected_unique_ids: set[str],
+) -> None:
+    """Drop registry entries for controls a fixture no longer exposes.
+
+    Earlier releases created a color temperature control for every fixture,
+    including fixed-white ones. Removing the orphaned entries keeps them from
+    lingering as permanently unavailable entities.
+    """
+    registry = er.async_get(hass)
+    for registry_entry in er.async_entries_for_config_entry(
+        registry,
+        entry.entry_id,
+    ):
+        if registry_entry.domain != NUMBER_DOMAIN:
+            continue
+        if registry_entry.unique_id in expected_unique_ids:
+            continue
+        registry.async_remove(registry_entry.entity_id)
 
 
 class AmaranBleColorNumber(NumberEntity):

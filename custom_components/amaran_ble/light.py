@@ -58,18 +58,31 @@ class AmaranBleLight(LightEntity, RestoreEntity):
         self._controller = controller
         self._config = config
         self._attr_unique_id = f"amaran_ble_{config.mac.lower().replace(':', '')}_{config.mesh_address:04x}"
-        self._attr_min_color_temp_kelvin = config.min_kelvin
-        self._attr_max_color_temp_kelvin = config.max_kelvin
-        color_modes = {ColorMode.COLOR_TEMP}
+        color_modes: set[ColorMode] = set()
+        if config.supports_cct:
+            color_modes.add(ColorMode.COLOR_TEMP)
+            self._attr_min_color_temp_kelvin = config.min_kelvin
+            self._attr_max_color_temp_kelvin = config.max_kelvin
         if config.supports_hs:
             color_modes.add(ColorMode.HS)
+        if not color_modes:
+            # A fixed-white fixture only accepts power and brightness.
+            color_modes.add(ColorMode.BRIGHTNESS)
         self._attr_supported_color_modes = color_modes
-        self._attr_color_mode = ColorMode.COLOR_TEMP
+        if config.supports_cct:
+            self._default_color_mode = ColorMode.COLOR_TEMP
+        elif config.supports_hs:
+            self._default_color_mode = ColorMode.HS
+        else:
+            self._default_color_mode = ColorMode.BRIGHTNESS
+        self._attr_color_mode = self._default_color_mode
         self._attr_is_on = None
         self._attr_available = False
         self._attr_brightness = 255
         fixture_state = controller.fixture_state(config.mesh_address)
-        self._attr_color_temp_kelvin = fixture_state.kelvin
+        self._attr_color_temp_kelvin = (
+            fixture_state.kelvin if config.supports_cct else None
+        )
         self._attr_hs_color = (0.0, 100.0)
 
     async def async_added_to_hass(self) -> None:
@@ -147,11 +160,13 @@ class AmaranBleLight(LightEntity, RestoreEntity):
     def extra_state_attributes(self) -> dict[str, int | float]:
         """Expose Amaran-specific color metadata."""
         state = self._controller.fixture_state(self._config.mesh_address)
-        return {
+        attributes: dict[str, int | float] = {
             ATTR_GREEN_MAGENTA: state.gm,
-            "color_temperature_step_kelvin": CCT_STEP_KELVIN,
             "hsi_intensity": state.intensity / 10,
         }
+        if self._config.supports_cct:
+            attributes["color_temperature_step_kelvin"] = CCT_STEP_KELVIN
+        return attributes
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the light on."""
@@ -185,7 +200,7 @@ class AmaranBleLight(LightEntity, RestoreEntity):
             )
             self._attr_hs_color = (float(hue), float(saturation))
             self._attr_color_mode = ColorMode.HS
-        elif ATTR_COLOR_TEMP_KELVIN in kwargs:
+        elif ATTR_COLOR_TEMP_KELVIN in kwargs and self._config.supports_cct:
             kelvin = quantize_kelvin(
                 kwargs[ATTR_COLOR_TEMP_KELVIN],
                 self._config.min_kelvin,
@@ -268,13 +283,15 @@ class AmaranBleLight(LightEntity, RestoreEntity):
                 float(state.hue),
                 float(state.saturation),
             )
-        else:
+        elif self._config.supports_cct:
             self._attr_color_mode = ColorMode.COLOR_TEMP
             self._attr_color_temp_kelvin = state.kelvin
+        else:
+            self._attr_color_mode = self._default_color_mode
         self._ensure_supported_color_mode()
         self.async_write_ha_state()
 
     def _ensure_supported_color_mode(self) -> None:
         """Normalize restored or stale state to this fixture's capabilities."""
         if self._attr_color_mode not in self._attr_supported_color_modes:
-            self._attr_color_mode = ColorMode.COLOR_TEMP
+            self._attr_color_mode = self._default_color_mode

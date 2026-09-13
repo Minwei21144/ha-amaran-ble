@@ -102,6 +102,56 @@ class ConfigParsingTest(unittest.TestCase):
         self.assertFalse(light.supports_hs)
         self.assertFalse(light.supports_gm)
 
+    def test_fixed_white_fixture_has_no_adjustable_cct(self) -> None:
+        config = parse_config_json(
+            json.dumps(
+                {
+                    "net_key": "00112233445566778899AABBCCDDEEFF",
+                    "app_key": "FFEEDDCCBBAA99887766554433221100",
+                    "lights": [
+                        {
+                            "name": "amaran fixed white #1",
+                            "mac": "AA:BB:CC:11:22:33",
+                            "mesh_address": 2,
+                            "min_kelvin": 5600,
+                            "max_kelvin": 5600,
+                            "supports_hs": False,
+                            "supports_gm": False,
+                        },
+                        {
+                            "name": "amaran 200x #1",
+                            "mac": "AA:BB:CC:44:55:66",
+                            "mesh_address": 6,
+                            "min_kelvin": 2700,
+                            "max_kelvin": 6500,
+                        },
+                    ],
+                }
+            )
+        )
+        fixed_white, bicolor = config.lights
+        self.assertFalse(fixed_white.supports_cct)
+        self.assertTrue(bicolor.supports_cct)
+
+    def test_reject_inverted_cct_range(self) -> None:
+        with self.assertRaisesRegex(ValueError, "invalid CCT range"):
+            parse_config_json(
+                json.dumps(
+                    {
+                        "net_key": "00112233445566778899AABBCCDDEEFF",
+                        "app_key": "FFEEDDCCBBAA99887766554433221100",
+                        "lights": [
+                            {
+                                "mac": "AA:BB:CC:11:22:33",
+                                "mesh_address": 5,
+                                "min_kelvin": 6500,
+                                "max_kelvin": 2700,
+                            }
+                        ],
+                    }
+                )
+            )
+
     def test_reject_bad_key(self) -> None:
         with self.assertRaises(ValueError):
             parse_config_json(

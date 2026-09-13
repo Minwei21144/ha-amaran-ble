@@ -24,6 +24,7 @@ def _install_homeassistant_light_stubs() -> None:
     light = ModuleType("homeassistant.components.light")
 
     class ColorMode(str, Enum):
+        BRIGHTNESS = "brightness"
         COLOR_TEMP = "color_temp"
         HS = "hs"
 
@@ -116,9 +117,34 @@ class _FakeController:
         self._state = color_state_module.FixtureColorState.from_config(
             config
         )
+        self.calls: list[tuple[object, ...]] = []
 
     def is_light_available(self, _mac: str) -> bool:
         return False
+
+    async def async_turn_on(self, mac: str, mesh_address: int) -> None:
+        self.calls.append(("turn_on", mac, mesh_address))
+        self._state.apply_power(True)
+
+    async def async_set_brightness(
+        self,
+        mac: str,
+        mesh_address: int,
+        intensity: int,
+    ) -> None:
+        self.calls.append(("set_brightness", mac, mesh_address, intensity))
+        self._state.apply_intensity(intensity)
+
+    async def async_set_cct(
+        self,
+        mac: str,
+        mesh_address: int,
+        kelvin: int,
+        intensity: int,
+        gm: int,
+    ) -> None:
+        self.calls.append(("set_cct", mac, mesh_address, kelvin, intensity, gm))
+        self._state.apply_cct(kelvin, intensity, gm)
 
     def async_track_availability(
         self,
@@ -145,17 +171,26 @@ class _FakeController:
         self._state = state.snapshot()
 
 
-def _fixture(*, supports_hs: bool) -> object:
+def _fixture(
+    *,
+    supports_hs: bool,
+    min_kelvin: int = 2700,
+    max_kelvin: int = 6500,
+) -> object:
     config = models_module.AmaranLightConfig(
         name="Test fixture",
         mac="AA:BB:CC:11:22:33",
         mesh_address=3,
-        min_kelvin=2700,
-        max_kelvin=6500,
+        min_kelvin=min_kelvin,
+        max_kelvin=max_kelvin,
         supports_hs=supports_hs,
         supports_gm=supports_hs,
     )
     return light_module.AmaranBleLight(_FakeController(config), config)
+
+
+def _fixed_white_fixture() -> object:
+    return _fixture(supports_hs=False, min_kelvin=5600, max_kelvin=5600)
 
 
 class LightRestoreTests(unittest.IsolatedAsyncioTestCase):
@@ -217,6 +252,79 @@ class LightRestoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(entity._attr_color_temp_kelvin, 4600)
         self.assertEqual(entity.extra_state_attributes["green_magenta"], -4)
+
+    def test_adjustable_cct_fixture_exposes_color_temperature(self) -> None:
+        entity = _fixture(supports_hs=False)
+
+        self.assertEqual(
+            entity._attr_supported_color_modes,
+            {light_module.ColorMode.COLOR_TEMP},
+        )
+        self.assertEqual(entity._attr_min_color_temp_kelvin, 2700)
+        self.assertEqual(entity._attr_max_color_temp_kelvin, 6500)
+        self.assertIn(
+            "color_temperature_step_kelvin",
+            entity.extra_state_attributes,
+        )
+
+    def test_fixed_white_fixture_is_brightness_only(self) -> None:
+        entity = _fixed_white_fixture()
+
+        self.assertEqual(
+            entity._attr_supported_color_modes,
+            {light_module.ColorMode.BRIGHTNESS},
+        )
+        self.assertEqual(
+            entity._attr_color_mode,
+            light_module.ColorMode.BRIGHTNESS,
+        )
+        self.assertIsNone(getattr(entity, "_attr_min_color_temp_kelvin", None))
+        self.assertIsNone(getattr(entity, "_attr_max_color_temp_kelvin", None))
+        self.assertIsNone(entity._attr_color_temp_kelvin)
+        self.assertNotIn(
+            "color_temperature_step_kelvin",
+            entity.extra_state_attributes,
+        )
+
+    async def test_fixed_white_fixture_ignores_restored_color_temp_mode(
+        self,
+    ) -> None:
+        entity = _fixed_white_fixture()
+        entity._test_last_state = SimpleNamespace(
+            state="on",
+            attributes={
+                "brightness": 200,
+                "color_mode": light_module.ColorMode.COLOR_TEMP,
+                "color_temp_kelvin": 5600,
+            },
+        )
+
+        await entity.async_added_to_hass()
+
+        self.assertEqual(
+            entity._attr_color_mode,
+            light_module.ColorMode.BRIGHTNESS,
+        )
+        self.assertEqual(entity._attr_brightness, 200)
+
+    async def test_fixed_white_fixture_turn_on_sends_brightness_only(
+        self,
+    ) -> None:
+        entity = _fixed_white_fixture()
+
+        await entity.async_turn_on(brightness=128, color_temp_kelvin=5600)
+
+        self.assertEqual(
+            entity._controller.calls,
+            [
+                ("turn_on", "AA:BB:CC:11:22:33", 3),
+                ("set_brightness", "AA:BB:CC:11:22:33", 3, 502),
+            ],
+        )
+        self.assertEqual(
+            entity._attr_color_mode,
+            light_module.ColorMode.BRIGHTNESS,
+        )
 
     def test_availability_update_normalizes_stale_unsupported_mode(self) -> None:
         entity = _fixture(supports_hs=False)

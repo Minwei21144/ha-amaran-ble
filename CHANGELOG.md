@@ -4,6 +4,15 @@ All notable public changes are documented in this file.
 
 [繁體中文更新日誌](CHANGELOG.zh-TW.md)
 
+## Unreleased
+
+- Only offer color temperature controls to fixtures whose imported CCT range
+  is adjustable. Fixed-white fixtures (`min_kelvin` equal to `max_kelvin`)
+  now expose a brightness-only light entity and no color temperature number
+  entity, and a leftover color temperature entity from an earlier release is
+  removed from the entity registry on startup.
+- Reject imported fixtures whose `min_kelvin` is larger than `max_kelvin`.
+
 ## 0.5.0-beta.107 - 2026-09-11
 
 Source update; the latest tagged HACS release remains `v0.5.0-beta.106`.

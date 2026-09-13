@@ -159,6 +159,8 @@ fixture-specific number entities:
 - **Brightness:** `0.1%` to `100.0%` in `0.1%` steps for every fixture. It uses
   the independent Mesh brightness command and does not switch CCT/HSI mode.
 - **Color temperature:** the imported fixture range in fixed `100 K` steps.
+  Fixed-white fixtures, exported with `min_kelvin` equal to `max_kelvin`, do
+  not get this control; their light entity is brightness-only.
 - **G/M:** `-10` to `+10` when `supports_gm` is enabled.
 - **Hue:** `0` to `360 degrees` and **Saturation:** `0%` to `100%` when
   `supports_hs` is enabled.

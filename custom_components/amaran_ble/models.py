@@ -33,6 +33,16 @@ class AmaranLightConfig:
     supports_hs: bool = True
     supports_gm: bool = True
 
+    @property
+    def supports_cct(self) -> bool:
+        """Return whether the fixture has an adjustable color temperature.
+
+        Fixed-white fixtures are exported with ``min_kelvin == max_kelvin``.
+        They accept power and brightness commands only, so no color
+        temperature control should be offered for them.
+        """
+        return self.max_kelvin > self.min_kelvin
+
 
 @dataclass(frozen=True)
 class AmaranConfig:
@@ -93,13 +103,20 @@ def parse_config_json(text: str) -> AmaranConfig:
             mesh_address = int(address_value)
         if mesh_address <= 0 or mesh_address > 0xFFFF:
             raise ValueError(f"lights[{index}].mesh_address must be 1..65535")
+        min_kelvin = int(raw_light.get("min_kelvin", raw_light.get("minKelvin", 2500)))
+        max_kelvin = int(raw_light.get("max_kelvin", raw_light.get("maxKelvin", 7500)))
+        if min_kelvin <= 0 or max_kelvin < min_kelvin:
+            raise ValueError(
+                f"lights[{index}] has an invalid CCT range: "
+                f"{min_kelvin}K..{max_kelvin}K"
+            )
         lights.append(
             AmaranLightConfig(
                 name=name,
                 mac=mac,
                 mesh_address=mesh_address,
-                min_kelvin=int(raw_light.get("min_kelvin", raw_light.get("minKelvin", 2500))),
-                max_kelvin=int(raw_light.get("max_kelvin", raw_light.get("maxKelvin", 7500))),
+                min_kelvin=min_kelvin,
+                max_kelvin=max_kelvin,
                 supports_hs=bool(raw_light.get("supports_hs", raw_light.get("supportsHs", True))),
                 supports_gm=bool(raw_light.get("supports_gm", raw_light.get("supportsGm", True))),
             )
