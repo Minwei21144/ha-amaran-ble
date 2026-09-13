@@ -93,7 +93,9 @@ SHARE_VERIFIED_GATT_CACHE_BETWEEN_CANDIDATES = True
 # supervision timeout. Prime the standard Mesh Proxy handles observed on
 # independently discovered T2c fixtures so the proxy can use V3 with-cache and
 # report a physical open immediately. A later Mesh login still verifies the
-# profile before it is shared with any peer candidate.
+# profile before it is shared with any peer candidate. A fixture that rejects
+# the guessed handles with a GATT error is retried once with full service
+# discovery instead of being rotated away as terminally broken.
 PRIME_TELINK_MESH_PROXY_BOOTSTRAP_CACHE = True
 TELINK_MESH_PROXY_SERVICE_HANDLE = 49
 TELINK_MESH_PROXY_DATA_IN_HANDLE = 51
@@ -460,6 +462,7 @@ class AmaranBleController:
         self._verified_gatt_cache_template: tuple[object, int, str] | None = None
         self._shared_gatt_cache_sources: dict[str, str] = {}
         self._bootstrap_gatt_cache_sources: set[str] = set()
+        self._bootstrap_gatt_cache_rejected: set[str] = set()
         self._shared_gatt_cache_incompatible: set[str] = set()
         self._current_connect_trace: dict[str, object] | None = None
         self._connect_attempt_stats: dict[str, int] = {}
@@ -829,6 +832,7 @@ class AmaranBleController:
         """Start the next ownership cycle without stale GATT recovery flags."""
         self._service_cache_bypass.clear()
         self._cccd_reconnect_pending.clear()
+        self._bootstrap_gatt_cache_rejected.clear()
         self._cached_cccd_retry_attempted.clear()
         self._uncached_recovery_attempted.clear()
         self._authorization_recovery_attempted.clear()
@@ -1191,10 +1195,18 @@ class AmaranBleController:
             return
         if failed_address in self._cccd_reconnect_pending:
             self._cccd_reconnect_pending.discard(failed_address)
-            handoff_address = self._fresh_cccd_handoff_candidate(
-                failed_address,
-                addresses,
-            )
+            if failed_address in self._bootstrap_gatt_cache_rejected:
+                # The fixture rejected the guessed bootstrap handle table. A
+                # handoff cannot help because every untested peer would be
+                # primed with the same guess; retry this candidate with full
+                # service discovery first.
+                self._bootstrap_gatt_cache_rejected.discard(failed_address)
+                handoff_address = None
+            else:
+                handoff_address = self._fresh_cccd_handoff_candidate(
+                    failed_address,
+                    addresses,
+                )
             if handoff_address is not None:
                 self._round_failed_candidates.add(failed_address)
                 self._candidate_cursor = addresses.index(handoff_address)
@@ -2657,6 +2669,9 @@ class AmaranBleController:
             "bootstrap_gatt_cache_sources": sorted(
                 self._bootstrap_gatt_cache_sources
             ),
+            "bootstrap_gatt_cache_rejected": sorted(
+                self._bootstrap_gatt_cache_rejected
+            ),
             "shared_gatt_cache_incompatible": sorted(
                 self._shared_gatt_cache_incompatible
             ),
@@ -2801,6 +2816,8 @@ class AmaranBleController:
             return "proxy_slot_recovery"
         if "insufficient authorization" in detail:
             return "gatt_authorization"
+        if "bootstrap gatt handle table" in detail:
+            return "bootstrap_gatt_profile_rejected"
         if "cccd notification setup failed" in detail:
             return "cccd_timeout"
         if "disconnect timed out: true" in detail:
@@ -2836,6 +2853,12 @@ class AmaranBleController:
                 "Proxy can see advertisements but GATT connect is timing out; "
                 "close vendor apps, keep the ESPHome Bluetooth Proxy near the fixtures, "
                 "or use a native HA Bluetooth adapter for comparison."
+            )
+        if hint == "bootstrap_gatt_profile_rejected":
+            return (
+                "The fixture rejected the built-in Telink Mesh Proxy GATT handle "
+                "table used to skip cold service discovery; the same fixture "
+                "will reconnect once with full service discovery."
             )
         if hint == "cccd_timeout":
             return (
@@ -3316,6 +3339,21 @@ class AmaranBleController:
             await self._enable_proxy_notifications(session)
         except Exception as err:  # noqa: BLE001 - reconnect owns the next retry.
             detail = self._format_error(err)
+            if (
+                not isinstance(err, TimeoutError)
+                and session.address in self._bootstrap_gatt_cache_sources
+                and "insufficient authorization" not in detail.lower()
+            ):
+                # The GATT handle table for this session was the unverified
+                # bootstrap guess, not a discovered one. A GATT error on it
+                # means the guess does not match this fixture's firmware, so
+                # the same candidate must be retried with real discovery.
+                await self._discard_failed_bootstrap_gatt_cache(session)
+                raise RuntimeError(
+                    "Mesh Proxy CCCD notification setup failed on the bootstrap "
+                    "GATT handle table; reconnect required and the next service "
+                    f"discovery will bypass cache: {detail}"
+                ) from err
             if not isinstance(err, TimeoutError):
                 # A descriptor/GATT error means the current link is unusable.
                 # Terminal descriptor errors rotate immediately. In
@@ -3382,6 +3420,7 @@ class AmaranBleController:
         self._cccd_reconnect_pending.discard(session.address)
         self._cached_cccd_retry_attempted.discard(session.address)
         self._uncached_recovery_attempted.discard(session.address)
+        self._bootstrap_gatt_cache_rejected.discard(session.address)
         self._authorization_recovery_attempted.discard(session.address)
         self._authorization_reconnect_after = 0.0
         self._notify_diagnostics()
@@ -4987,6 +5026,37 @@ class AmaranBleController:
             "table from %s; the next attempt will perform full service discovery",
             session.address,
             source,
+        )
+        self._notify_diagnostics()
+
+    async def _discard_failed_bootstrap_gatt_cache(
+        self,
+        session: _ProxySession,
+    ) -> None:
+        """Fall back to discovery when a fixture rejects the bootstrap table.
+
+        The bootstrap profile is the handle layout observed on T2c fixtures.
+        Other Amaran models can place the Mesh Proxy characteristics at
+        different handles, and ESPHome then reports a terminal GATT error
+        (for example ``error=135 Illegal parameter``) when the CCCD write goes
+        to the guessed handle. Without this fallback every candidate keeps
+        failing on the same guess and the Mesh is never acquired.
+        """
+        self._bootstrap_gatt_cache_sources.discard(session.address)
+        self._bootstrap_gatt_cache_rejected.add(session.address)
+        self._service_cache_bypass.add(session.address)
+        self._cccd_reconnect_pending.add(session.address)
+        self._cached_cccd_retry_attempted.discard(session.address)
+        self._uncached_recovery_attempted.discard(session.address)
+        if session.client is not None:
+            self._discard_target_local_gatt_cache(session.client, session.address)
+        await self._clear_gatt_service_cache(session)
+        key = "bootstrap_gatt_cache_fallbacks"
+        self._connect_attempt_stats[key] = self._connect_attempt_stats.get(key, 0) + 1
+        _LOGGER.warning(
+            "Amaran BLE proxy %s rejected the bootstrap Telink Mesh Proxy GATT "
+            "handle table; the next attempt will perform full service discovery",
+            session.address,
         )
         self._notify_diagnostics()
 

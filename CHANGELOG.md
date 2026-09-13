@@ -4,6 +4,18 @@ All notable public changes are documented in this file.
 
 [繁體中文更新日誌](CHANGELOG.zh-TW.md)
 
+## Unreleased
+
+- Retry a Mesh Proxy candidate with full GATT service discovery when it
+  rejects the built-in Telink handle table during notification setup (for
+  example ESPHome `error=135 Illegal parameter` on handle 53). Previously such
+  fixtures were treated as terminally broken and rotated forever, so a Mesh
+  made of models other than the validated T2c/200x/300c could never be
+  acquired through an ESPHome Bluetooth Proxy. Adds the
+  `bootstrap_gatt_profile_rejected` diagnostics hint and the
+  `bootstrap_gatt_cache_rejected` and `bootstrap_gatt_cache_fallbacks`
+  diagnostics fields.
+
 ## 0.5.0-beta.107 - 2026-09-11
 
 Source update; the latest tagged HACS release remains `v0.5.0-beta.106`.

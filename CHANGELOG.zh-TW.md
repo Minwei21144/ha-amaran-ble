@@ -7,6 +7,15 @@
 每個公開版本都必須同步更新英文與繁體中文日誌，並保留等義的版本資訊。
 未公開的中間測試版可以只記錄於英文工程日誌，不列入本公開版本清單。
 
+## 未發布
+
+- 當 Mesh Proxy 候選燈具在通知設定階段拒絕內建的 Telink GATT handle 表
+  （例如 ESPHome 回報 handle 53 的 `error=135 Illegal parameter`）時，改以完整的
+  GATT 服務探索重試同一燈具。先前此類燈具會被視為永久失敗而不斷輪替，導致由
+  T2c/200x/300c 以外機型組成的 Mesh 永遠無法透過 ESPHome Bluetooth Proxy 連線。
+  新增 `bootstrap_gatt_profile_rejected` 診斷提示，以及
+  `bootstrap_gatt_cache_rejected` 與 `bootstrap_gatt_cache_fallbacks` 診斷欄位。
+
 ## 0.5.0-beta.107 - 2026-09-11
 
 本次為原始碼更新；目前已建立 Tag 的 HACS 發行版仍為 `v0.5.0-beta.106`。
