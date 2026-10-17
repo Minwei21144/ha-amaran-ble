@@ -12,6 +12,14 @@ All notable public changes are documented in this file.
   entity, and a leftover color temperature entity from an earlier release is
   removed from the entity registry on startup.
 - Reject imported fixtures whose `min_kelvin` is larger than `max_kelvin`.
+- Retry a Mesh Proxy candidate with full GATT service discovery when it
+  rejects the built-in Telink handle table during notification setup (for
+  example ESPHome `error=135 Illegal parameter` on handle 53). Previously such
+  fixtures with incompatible layouts could keep rotating without ever trying
+  actual service discovery through an ESPHome Bluetooth Proxy. Adds the
+  `bootstrap_gatt_profile_rejected` diagnostics hint and the
+  `bootstrap_gatt_cache_rejected` and `bootstrap_gatt_cache_fallbacks`
+  diagnostics fields.
 
 ## 0.5.0-beta.107 - 2026-09-11
 

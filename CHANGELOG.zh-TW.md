@@ -13,6 +13,12 @@
   等於 `max_kelvin`）的燈光實體現在只提供電源與亮度，不再建立色溫數值實體；
   舊版本遺留的色溫實體會在啟動時從實體註冊表中移除。
 - 拒絕匯入 `min_kelvin` 大於 `max_kelvin` 的燈具設定。
+- 當 Mesh Proxy 候選燈具在通知設定階段拒絕內建的 Telink GATT handle 表
+  （例如 ESPHome 回報 handle 53 的 `error=135 Illegal parameter`）時，改以完整的
+  GATT 服務探索重試同一燈具。先前使用不相容位置表的燈具可能不斷輪替，卻未
+  透過 ESPHome Bluetooth Proxy 嘗試實際的服務探索。
+  新增 `bootstrap_gatt_profile_rejected` 診斷提示，以及
+  `bootstrap_gatt_cache_rejected` 與 `bootstrap_gatt_cache_fallbacks` 診斷欄位。
 
 ## 0.5.0-beta.107 - 2026-09-11
 

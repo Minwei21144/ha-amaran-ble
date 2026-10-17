@@ -3610,6 +3610,144 @@ class ControllerAvailabilityTest(unittest.TestCase):
         self.assertNotIn(light.mac, controller._uncached_recovery_attempted)
         self.assertEqual(client.clear_cache_calls, 0)
 
+    def test_bootstrap_table_rejection_retries_same_candidate_uncached(
+        self,
+    ) -> None:
+        controller, light = self._make_controller()
+        controller_module = importlib.import_module(
+            "custom_components.amaran_ble.controller"
+        )
+
+        class FakeClient:
+            is_connected = True
+
+            def __init__(self) -> None:
+                self.clear_cache_calls = 0
+
+            async def start_notify(self, *_args: object) -> None:
+                raise RuntimeError(
+                    "Bluetooth GATT Error address=AA:BB:CC:11:22:33 handle=53 "
+                    "error=135 description=Illegal parameter"
+                )
+
+            async def clear_cache(self) -> bool:
+                self.clear_cache_calls += 1
+                return True
+
+        client = FakeClient()
+        session = controller_module._ProxySession(
+            address=light.mac,
+            client=client,
+            proxy_data_in=object(),
+            proxy_data_out=object(),
+            status_notifications_supported=False,
+            notification_callback=lambda *_args: None,
+        )
+        controller._sessions[light.mac] = session
+        controller._bootstrap_gatt_cache_sources.add(light.mac)
+
+        with self.assertRaisesRegex(RuntimeError, "bootstrap GATT handle table"):
+            asyncio.run(controller._enable_proxy_notifications_for_session(session))
+
+        self.assertNotIn(light.mac, controller._bootstrap_gatt_cache_sources)
+        self.assertIn(light.mac, controller._bootstrap_gatt_cache_rejected)
+        self.assertIn(light.mac, controller._service_cache_bypass)
+        self.assertIn(light.mac, controller._cccd_reconnect_pending)
+        self.assertNotIn(light.mac, controller._cached_cccd_retry_attempted)
+        self.assertEqual(client.clear_cache_calls, 1)
+        self.assertEqual(
+            controller._connect_attempt_stats["bootstrap_gatt_cache_fallbacks"],
+            1,
+        )
+        self.assertEqual(
+            controller.diagnostic_state()["bootstrap_gatt_cache_rejected"],
+            [light.mac],
+        )
+
+        controller._last_maintain_error = (
+            "RuntimeError: Mesh Proxy CCCD notification setup failed on the "
+            "bootstrap GATT handle table; reconnect required and the next "
+            "service discovery will bypass cache: BleakError: Bluetooth GATT "
+            "Error handle=53 error=135 description=Illegal parameter"
+        )
+        self.assertEqual(
+            controller._last_error_hint(),
+            "bootstrap_gatt_profile_rejected",
+        )
+        self.assertIn("full service discovery", controller._connection_advice())
+
+    def test_bootstrap_table_rejection_skips_handoff_to_untested_peer(
+        self,
+    ) -> None:
+        controller, light = self._make_controller()
+        other = "AA:BB:CC:44:55:66"
+        controller.config.proxy_candidates.append(other)
+        controller._service_cache_bypass.add(light.mac)
+        controller._cccd_reconnect_pending.add(light.mac)
+        controller._bootstrap_gatt_cache_rejected.add(light.mac)
+        controller._has_fresh_ble_device = (  # type: ignore[method-assign]
+            lambda address, **_kwargs: address == other
+        )
+
+        controller._advance_candidate_cursor(
+            light.mac,
+            RuntimeError(
+                "Mesh Proxy CCCD notification setup failed on the bootstrap "
+                "GATT handle table"
+            ),
+        )
+
+        self.assertEqual(controller._candidate_cursor, 0)
+        self.assertNotIn(light.mac, controller._bootstrap_gatt_cache_rejected)
+        self.assertNotIn(light.mac, controller._cccd_reconnect_pending)
+        self.assertIn(light.mac, controller._service_cache_bypass)
+        self.assertNotIn(light.mac, controller._candidate_cooldown_until)
+        self.assertNotIn(light.mac, controller._round_failed_candidates)
+
+    def test_bootstrap_session_authorization_error_keeps_authorization_path(
+        self,
+    ) -> None:
+        controller, light = self._make_controller()
+        controller_module = importlib.import_module(
+            "custom_components.amaran_ble.controller"
+        )
+
+        class FakeClient:
+            is_connected = False
+
+            async def start_notify(self, *_args: object) -> None:
+                raise RuntimeError("Insufficient authorization (8)")
+
+        session = controller_module._ProxySession(
+            address=light.mac,
+            client=FakeClient(),
+            proxy_data_in=object(),
+            proxy_data_out=object(),
+            status_notifications_supported=False,
+            notification_callback=lambda *_args: None,
+        )
+        controller._sessions[light.mac] = session
+        controller._bootstrap_gatt_cache_sources.add(light.mac)
+
+        with self.assertRaisesRegex(RuntimeError, "authorization error"):
+            asyncio.run(controller._enable_proxy_notifications_for_session(session))
+
+        self.assertNotIn(light.mac, controller._bootstrap_gatt_cache_rejected)
+        self.assertNotIn(light.mac, controller._service_cache_bypass)
+        self.assertNotIn(light.mac, controller._cccd_reconnect_pending)
+
+    def test_release_clears_bootstrap_rejection_flag(self) -> None:
+        controller, light = self._make_controller()
+        controller._bootstrap_gatt_cache_rejected.add(light.mac)
+
+        controller._reset_connection_recovery_state()
+
+        self.assertEqual(controller._bootstrap_gatt_cache_rejected, set())
+        self.assertEqual(
+            controller.diagnostic_state()["bootstrap_gatt_cache_rejected"],
+            [],
+        )
+
     def test_authorization_notification_error_requests_fresh_gatt_object(self) -> None:
         controller, light = self._make_controller()
         controller_module = importlib.import_module(

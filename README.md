@@ -235,6 +235,10 @@ Check these items first:
 4. Turn the Amaran BLE control switch off, wait for `released`, then turn it on.
 5. Download diagnostics before opening an issue. Diagnostics are sanitized, but
    review them before sharing.
+6. If diagnostics show `last_error_hint: bootstrap_gatt_profile_rejected`, the
+   fixture uses a different GATT handle layout than the validated T2c. The
+   integration retries that fixture with full service discovery automatically;
+   please report the fixture model so it can be added to the validated list.
 
 ## Development
 
