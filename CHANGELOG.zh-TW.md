@@ -19,6 +19,10 @@
   透過 ESPHome Bluetooth Proxy 嘗試實際的服務探索。
   新增 `bootstrap_gatt_profile_rejected` 診斷提示，以及
   `bootstrap_gatt_cache_rejected` 與 `bootstrap_gatt_cache_fallbacks` 診斷欄位。
+- 補上維護者回歸測試，涵蓋預設表通知成功、既有逾時處理、完整探索重試成功／
+  失敗、僅支援 HS 的燈具及數值控制能力組合，整合後 237 項測試通過。
+- 審查與整合結果，以及 CI 核准逾期原因，保存在
+  [繁體中文報告](docs/testing/PR-3-4-review-2026-10-17.zh-TW.md)。
 
 ## 0.5.0-beta.107 - 2026-09-11
 

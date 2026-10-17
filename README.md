@@ -236,7 +236,7 @@ Check these items first:
 5. Download diagnostics before opening an issue. Diagnostics are sanitized, but
    review them before sharing.
 6. If diagnostics show `last_error_hint: bootstrap_gatt_profile_rejected`, the
-   fixture uses a different GATT handle layout than the validated T2c. The
+   bootstrap handle table was rejected and may not match this fixture. The
    integration retries that fixture with full service discovery automatically;
    please report the fixture model so it can be added to the validated list.
 

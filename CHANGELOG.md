@@ -20,6 +20,11 @@ All notable public changes are documented in this file.
   `bootstrap_gatt_profile_rejected` diagnostics hint and the
   `bootstrap_gatt_cache_rejected` and `bootstrap_gatt_cache_fallbacks`
   diagnostics fields.
+- Add maintainer regression coverage for successful bootstrap notifications,
+  unchanged timeout handling, uncached recovery success/failure, HS-only lights
+  and numeric capability combinations. The integrated suite passes 237 tests.
+- Review and integration details, including the expired CI approval diagnosis,
+  are recorded in the [Traditional Chinese report](docs/testing/PR-3-4-review-2026-10-17.zh-TW.md).
 
 ## 0.5.0-beta.107 - 2026-09-11
 
