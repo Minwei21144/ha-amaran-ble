@@ -344,6 +344,25 @@ class NumberEntityTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_supported_controls_capability_matrix(self) -> None:
+        rgb, bicolor = _fixtures()
+        fixed = _fixed_white_fixture()
+        hs_only = models_module.AmaranLightConfig(
+            name="Test HS fixture", mac="AA:BB:CC:77:88:AA", mesh_address=10,
+            min_kelvin=5600, max_kelvin=5600, supports_hs=True, supports_gm=False,
+        )
+        for config, expected in (
+            (rgb, ["hsi_intensity", "color_temperature", "green_magenta", "hue", "saturation"]),
+            (bicolor, ["hsi_intensity", "color_temperature"]),
+            (fixed, ["hsi_intensity"]),
+            (hs_only, ["hsi_intensity", "hue", "saturation"]),
+        ):
+            with self.subTest(fixture=config.name):
+                self.assertEqual(
+                    [control.value for control in number_module.supported_controls(config)],
+                    expected,
+                )
+
     async def test_fixed_white_fixture_only_exposes_brightness(self) -> None:
         fixed_white = _fixed_white_fixture()
         controller = _FakeController([fixed_white])

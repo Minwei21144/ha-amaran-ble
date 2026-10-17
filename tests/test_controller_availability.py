@@ -3736,6 +3736,113 @@ class ControllerAvailabilityTest(unittest.TestCase):
         self.assertNotIn(light.mac, controller._service_cache_bypass)
         self.assertNotIn(light.mac, controller._cccd_reconnect_pending)
 
+    def test_bootstrap_success_keeps_normal_notification_path(self) -> None:
+        controller, light = self._make_controller()
+        module = importlib.import_module("custom_components.amaran_ble.controller")
+        client = types.SimpleNamespace(
+            is_connected=True, start_notify=AsyncMock(), clear_cache=AsyncMock(),
+        )
+        session = module._ProxySession(
+            address=light.mac, client=client, proxy_data_out=object(),
+            notification_callback=lambda *_args: None,
+        )
+        controller._bootstrap_gatt_cache_sources.add(light.mac)
+
+        self.assertTrue(asyncio.run(controller._enable_proxy_notifications_for_session(session)))
+
+        self.assertTrue(session.notify_started)
+        self.assertTrue(session.status_notifications_supported)
+        client.clear_cache.assert_not_awaited()
+        self.assertFalse(controller._bootstrap_gatt_cache_rejected)
+        self.assertFalse(controller._service_cache_bypass)
+        self.assertNotIn("bootstrap_gatt_cache_fallbacks", controller._connect_attempt_stats)
+
+    def test_bootstrap_timeout_preserves_existing_cached_retry(self) -> None:
+        controller, light = self._make_controller()
+        module = importlib.import_module("custom_components.amaran_ble.controller")
+        client = types.SimpleNamespace(
+            is_connected=False, start_notify=AsyncMock(side_effect=TimeoutError()),
+            clear_cache=AsyncMock(),
+        )
+        session = module._ProxySession(
+            address=light.mac, client=client, proxy_data_out=object(),
+            notification_callback=lambda *_args: None,
+        )
+        controller._bootstrap_gatt_cache_sources.add(light.mac)
+
+        with self.assertRaisesRegex(RuntimeError, "preserving the known"):
+            asyncio.run(controller._enable_proxy_notifications_for_session(session))
+
+        client.clear_cache.assert_not_awaited()
+        self.assertFalse(controller._bootstrap_gatt_cache_rejected)
+        self.assertFalse(controller._service_cache_bypass)
+        self.assertIn(light.mac, controller._cached_cccd_retry_attempted)
+        self.assertNotIn("bootstrap_gatt_cache_fallbacks", controller._connect_attempt_stats)
+
+    def test_bootstrap_fallback_requests_uncached_connection_and_recovers(self) -> None:
+        controller, light = self._make_controller()
+        module = importlib.import_module("custom_components.amaran_ble.controller")
+        client = types.SimpleNamespace(
+            is_connected=True,
+            start_notify=AsyncMock(side_effect=[RuntimeError("Illegal parameter (135)"), None]),
+            clear_cache=AsyncMock(return_value=True),
+        )
+        session = module._ProxySession(
+            address=light.mac, client=client, proxy_data_out=object(),
+            notification_callback=lambda *_args: None,
+        )
+        controller._bootstrap_gatt_cache_sources.add(light.mac)
+
+        async def exercise():
+            with self.assertRaisesRegex(RuntimeError, "bootstrap GATT handle table"):
+                await controller._enable_proxy_notifications_for_session(session)
+            controller._advance_candidate_cursor(light.mac, RuntimeError("reconnect required"))
+            with patch.object(module, "establish_connection", AsyncMock(return_value=client)) as connect:
+                await controller._establish_bleak_client(object(), light.mac, lambda *_args: None)
+                self.assertFalse(connect.call_args.kwargs["use_services_cache"])
+            self.assertTrue(await controller._enable_proxy_notifications_for_session(session))
+
+        asyncio.run(exercise())
+        client.clear_cache.assert_awaited_once()
+        self.assertEqual(controller._connect_attempt_stats["bootstrap_gatt_cache_fallbacks"], 1)
+        self.assertFalse(controller._bootstrap_gatt_cache_sources)
+        self.assertFalse(controller._bootstrap_gatt_cache_rejected)
+        self.assertFalse(controller._service_cache_bypass)
+        self.assertFalse(controller._cccd_reconnect_pending)
+        self.assertFalse(controller._uncached_recovery_attempted)
+
+    def test_bootstrap_fallback_does_not_loop_on_discovered_table_error(self) -> None:
+        controller, light = self._make_controller()
+        module = importlib.import_module("custom_components.amaran_ble.controller")
+        client = types.SimpleNamespace(
+            is_connected=False,
+            start_notify=AsyncMock(side_effect=RuntimeError("Illegal parameter (135)")),
+            clear_cache=AsyncMock(return_value=True),
+        )
+        session = module._ProxySession(
+            address=light.mac, client=client, proxy_data_out=object(),
+            notification_callback=lambda *_args: None,
+        )
+        controller._bootstrap_gatt_cache_sources.add(light.mac)
+
+        async def exercise():
+            with self.assertRaisesRegex(RuntimeError, "bootstrap GATT handle table"):
+                await controller._enable_proxy_notifications_for_session(session)
+            controller._advance_candidate_cursor(light.mac, RuntimeError("reconnect required"))
+            with patch.object(module, "establish_connection", AsyncMock(return_value=client)) as connect:
+                await controller._establish_bleak_client(object(), light.mac, lambda *_args: None)
+                self.assertFalse(connect.call_args.kwargs["use_services_cache"])
+            with self.assertRaisesRegex(RuntimeError, "terminal GATT error") as failure:
+                await controller._enable_proxy_notifications_for_session(session)
+            controller._advance_candidate_cursor(light.mac, failure.exception)
+
+        asyncio.run(exercise())
+        client.clear_cache.assert_awaited_once()
+        self.assertEqual(controller._connect_attempt_stats["bootstrap_gatt_cache_fallbacks"], 1)
+        self.assertIn(light.mac, controller._round_failed_candidates)
+        self.assertFalse(controller._cccd_reconnect_pending)
+        self.assertFalse(controller._service_cache_bypass)
+
     def test_release_clears_bootstrap_rejection_flag(self) -> None:
         controller, light = self._make_controller()
         controller._bootstrap_gatt_cache_rejected.add(light.mac)

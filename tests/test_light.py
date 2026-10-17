@@ -267,6 +267,15 @@ class LightRestoreTests(unittest.IsolatedAsyncioTestCase):
             entity.extra_state_attributes,
         )
 
+    def test_hs_only_fixture_keeps_hs_without_color_temperature(self) -> None:
+        entity = _fixture(supports_hs=True, min_kelvin=5600, max_kelvin=5600)
+        self.assertEqual(entity._attr_supported_color_modes, {light_module.ColorMode.HS})
+        self.assertEqual(entity._attr_color_mode, light_module.ColorMode.HS)
+        self.assertIsNone(entity._attr_color_temp_kelvin)
+        entity._handle_fixture_state(entity._controller.fixture_state(entity._config.mesh_address))
+        self.assertEqual(entity._attr_color_mode, light_module.ColorMode.HS)
+        self.assertNotIn("color_temperature_step_kelvin", entity.extra_state_attributes)
+
     def test_fixed_white_fixture_is_brightness_only(self) -> None:
         entity = _fixed_white_fixture()
 
